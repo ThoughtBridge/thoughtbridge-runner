@@ -351,6 +351,40 @@ async function waitForAnswer(tb: TB, captureId: string): Promise<string | null> 
   }
 }
 
+
+/**
+ * Done means MERGED: check this runner's pr_ready runs and report the
+ * outcome — done on merge, failed when the PR was closed unmerged. The
+ * backend reacts to the done transition by completing the thought.
+ */
+async function checkOpenPRs(tb: TB): Promise<void> {
+  const { runs } = await tb.mine();
+  for (const r of runs) {
+    if (r.status !== 'pr_ready') continue;
+    const capture = await tb.capture(r.captureId);
+    const run = capture['executeRun'] as { prUrl?: string | null } | null;
+    const prUrl = run?.prUrl;
+    if (!prUrl) continue;
+    try {
+      const state = sh(process.cwd(), 'gh', [
+        'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
+      ]).trim();
+      if (state === 'MERGED') {
+        console.log(`  ✔ PR merged → done: ${prUrl}`);
+        await tb.report(r.captureId, { status: 'done' });
+      } else if (state === 'CLOSED') {
+        console.log(`  ✖ PR closed unmerged: ${prUrl}`);
+        await tb.report(r.captureId, {
+          status: 'failed',
+          error: 'PR was closed without merging',
+        });
+      }
+    } catch (err) {
+      console.error('  pr check error:', err instanceof Error ? err.message : err);
+    }
+  }
+}
+
 // ── main loop ───────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -376,6 +410,7 @@ async function main(): Promise<void> {
 
   for (;;) {
     try {
+      await checkOpenPRs(tb);
       const { runs } = await tb.queue();
       if (runs.length > 0) {
         // One at a time, oldest first — a run can take a while.
