@@ -82,6 +82,8 @@ interface QueuedRun {
   executeInstruction: string | null;
   repoFullName: string | null;
   queuedAt: string;
+  status: string;
+  sessionId: string | null;
 }
 
 class TB {
@@ -105,6 +107,10 @@ class TB {
 
   queue(): Promise<{ runs: QueuedRun[] }> {
     return this.call('GET', '/runner/queue');
+  }
+  /** In-flight runs claimed by THIS runner — restart recovery. */
+  mine(): Promise<{ runs: QueuedRun[] }> {
+    return this.call('GET', `/runner/queue?mine=${encodeURIComponent(this.conf.runnerId)}`);
   }
   claim(captureId: string): Promise<Record<string, unknown>> {
     return this.call('POST', `/runner/runs/${captureId}/claim`, {
@@ -213,20 +219,32 @@ RULES
 - If you hit a decision only the user can make, output a single line starting with "QUESTION: " stating the question, then stop. You will be resumed with the answer.`;
 }
 
-async function executeRun(conf: Config, tb: TB, run: QueuedRun): Promise<void> {
+async function executeRun(
+  conf: Config,
+  tb: TB,
+  run: QueuedRun,
+  { recover = false }: { recover?: boolean } = {},
+): Promise<void> {
   const cid = run.captureId;
-  console.log(`▶ ${cid} — "${run.title ?? 'untitled'}" → ${run.repoFullName}`);
+  console.log(
+    `${recover ? '↻ recovering' : '▶'} ${cid} — "${run.title ?? 'untitled'}" → ${run.repoFullName}`,
+  );
   if (!run.repoFullName) {
     await tb.report(cid, { status: 'failed', error: 'No repoFullName on queue entry' });
     return;
   }
 
-  await tb.claim(cid);
+  if (!recover) await tb.claim(cid);
   const branch = `thought/${cid.slice(0, 8)}`;
 
   try {
-    const dir = ensureCheckout(conf.workdir, run.repoFullName);
-    sh(dir, 'git', ['checkout', '-B', branch]);
+    const dir = recover
+      ? join(conf.workdir, run.repoFullName.replace('/', '__'))
+      : ensureCheckout(conf.workdir, run.repoFullName);
+    if (recover && !existsSync(dir)) {
+      throw new Error('Checkout missing after restart — cancel and re-bridge this thought');
+    }
+    sh(dir, 'git', ['checkout', recover ? branch : '-B', ...(recover ? [] : [branch])]);
 
     const capture = await tb.capture(cid);
     const markdown =
@@ -234,8 +252,19 @@ async function executeRun(conf: Config, tb: TB, run: QueuedRun): Promise<void> {
       (capture['transcript'] as string | undefined) ??
       '(no transcript available)';
 
-    let sessionId: string | null = null;
-    let prompt = buildPrompt(conf, run, markdown, branch);
+    let sessionId: string | null = recover ? run.sessionId : null;
+    let prompt = recover && sessionId
+      ? 'The runner restarted. Continue the work order from where you left off — if it is already complete, summarise what was done. Same rules apply.'
+      : buildPrompt(conf, run, markdown, branch);
+    if (recover && run.status === 'awaiting_input') {
+      // Re-enter the wait: the question is still open in the app.
+      const answer = await waitForAnswer(tb, cid);
+      if (answer === null) {
+        console.log('  run cancelled while awaiting input');
+        return;
+      }
+      prompt = `The user answered: ${answer}\n\nContinue the work order. Same rules apply.`;
+    }
 
     // Session loop: run → maybe QUESTION → wait for answer → resume.
     for (;;) {
@@ -334,6 +363,16 @@ async function main(): Promise<void> {
     `thoughtbridge-runner ${conf.runnerId} on ${hostname()}` +
       (conf.agentCommand ? ` (agent command: ${conf.agentCommand})` : ' (plain prompt)'),
   );
+
+  // Restart recovery: pick up runs this runner had in flight.
+  try {
+    const { runs: mine } = await tb.mine();
+    for (const r of mine) {
+      await executeRun(conf, tb, r, { recover: true });
+    }
+  } catch (err) {
+    console.error('recovery error:', err instanceof Error ? err.message : err);
+  }
 
   for (;;) {
     try {
