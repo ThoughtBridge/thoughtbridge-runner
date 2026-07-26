@@ -329,6 +329,20 @@ async function executeRun(
     const message = err instanceof Error ? err.message : String(err);
     console.error(`  ✖ failed: ${message}`);
     try {
+      // Never mark a run failed when its PR actually merged — a late error
+      // (e.g. pushing a branch GitHub deleted on merge) is success noise.
+      const capture = await tb.capture(cid).catch(() => null);
+      const prUrl = (capture?.['executeRun'] as { prUrl?: string | null } | null)?.prUrl;
+      if (prUrl) {
+        const state = sh(process.cwd(), 'gh', [
+          'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
+        ]).trim();
+        if (state === 'MERGED') {
+          console.log('  PR is merged — reporting done despite the late error');
+          await tb.report(cid, { status: 'done' });
+          return;
+        }
+      }
       await tb.report(cid, { status: 'failed', error: message.slice(0, 500) });
     } catch {
       /* run may have been cancelled — nothing to report onto */
@@ -402,6 +416,10 @@ async function main(): Promise<void> {
   try {
     const { runs: mine } = await tb.mine();
     for (const r of mine) {
+      // pr_ready runs are DONE building — the merge-watcher owns them from
+      // here. Re-executing one re-pushes a branch that may already be merged
+      // and deleted, clobbering a successful run with 'failed'.
+      if (r.status === 'pr_ready') continue;
       await executeRun(conf, tb, r, { recover: true });
     }
   } catch (err) {
