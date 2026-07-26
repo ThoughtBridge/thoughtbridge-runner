@@ -171,7 +171,14 @@ async function runClaude(
   prompt: string,
   resumeSessionId: string | null,
 ): Promise<SessionResult> {
-  const args = ['-p', prompt, '--output-format', 'json'];
+  // Autonomous by definition: the session runs headless in the runner's own
+  // checkout, so nobody is present to approve tool calls. Without this flag
+  // every Edit/Write/git command is denied and the run stalls.
+  const args = [
+    '-p', prompt,
+    '--output-format', 'json',
+    '--dangerously-skip-permissions',
+  ];
   if (resumeSessionId) args.unshift('--resume', resumeSessionId);
   const { stdout } = await shAsync(cwd, 'claude', args, 45 * 60_000);
   const parsed = JSON.parse(stdout) as { session_id?: string; result?: string };
