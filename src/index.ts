@@ -367,6 +367,81 @@ async function waitForAnswer(tb: TB, captureId: string): Promise<string | null> 
 
 
 /**
+ * Approve & merge: the app flipped a pr_ready run to merge_requested. Resume
+ * the stored Claude session in the repo checkout so it can update the branch
+ * from main, resolve the expected conflicts (agent files, thoughts-state.json),
+ * and merge the PR. Conflicts are why a plain GitHub-API merge is not enough.
+ * On failure the run goes back to pr_ready with the error so the Approve
+ * button reappears and the merge can be retried.
+ */
+async function checkMergeRequests(conf: Config, tb: TB): Promise<void> {
+  const { runs } = await tb.mine();
+  for (const r of runs) {
+    // merging = we crashed mid-merge on a previous cycle; re-enter the flow
+    // (the merge prompt is idempotent — an already-merged PR just verifies).
+    if (r.status !== 'merge_requested' && r.status !== 'merging') continue;
+    const cid = r.captureId;
+    const capture = await tb.capture(cid);
+    const run = capture['executeRun'] as
+      | { prUrl?: string | null; branch?: string | null; sessionId?: string | null }
+      | null;
+    const prUrl = run?.prUrl;
+    const branch = run?.branch ?? `thought/${cid.slice(0, 8)}`;
+    if (!prUrl || !r.repoFullName) {
+      await tb.report(cid, { status: 'pr_ready', error: 'Merge request missing PR or repo' });
+      continue;
+    }
+    console.log(`⇥ merging ${cid} — ${prUrl}`);
+    try {
+      await tb.report(cid, { status: 'merging' });
+      const dir = ensureCheckout(conf.workdir, r.repoFullName);
+      const prompt = `The user approved the PR for this work order — merge it into the default branch now.
+
+PR: ${prUrl}
+Branch: ${branch}
+
+Steps:
+1. Read the PR with \`gh pr view ${prUrl}\`.
+2. \`git fetch origin\`, check out ${branch}, and merge origin's default branch into it.
+3. Resolve any conflicts:
+   - Agent/instruction files (AGENTS.md, CLAUDE.md, tasks/*.md): union both sides — keep everyone's entries.
+   - thoughts-state.json: reconcile PER ENTRY — for each thought id keep the side with the newest updatedAt; never drop entries that exist on only one side.
+   - Anything else: prefer the intent of the PR while keeping unrelated changes from the default branch.
+4. Commit the merge, push the branch, then \`gh pr merge ${prUrl} --merge --delete-branch\`.
+5. Confirm \`gh pr view ${prUrl} --json state\` reports MERGED. If the PR was already merged, that's success — say so and stop.
+
+Do NOT commit directly to the default branch. No AI attribution in commit messages.`;
+      const result = await runClaude(dir, prompt, r.sessionId ?? run?.sessionId ?? null);
+      const state = sh(dir, 'gh', [
+        'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
+      ]).trim();
+      if (state === 'MERGED') {
+        console.log(`  ✔ merged → done: ${prUrl}`);
+        await tb.report(cid, { status: 'done', sessionId: result.sessionId });
+      } else {
+        const tail = result.text.trim().slice(-300);
+        await tb.report(cid, {
+          status: 'pr_ready',
+          error: `Merge attempt ended with PR still ${state}. ${tail}`.slice(0, 500),
+        });
+        console.log(`  ✖ merge did not complete (PR ${state})`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`  ✖ merge failed: ${message}`);
+      try {
+        await tb.report(cid, {
+          status: 'pr_ready',
+          error: `Merge failed: ${message}`.slice(0, 500),
+        });
+      } catch {
+        /* run may have been cancelled */
+      }
+    }
+  }
+}
+
+/**
  * Done means MERGED: check this runner's pr_ready runs and report the
  * outcome — done on merge, failed when the PR was closed unmerged. The
  * backend reacts to the done transition by completing the thought.
@@ -418,8 +493,10 @@ async function main(): Promise<void> {
     for (const r of mine) {
       // pr_ready runs are DONE building — the merge-watcher owns them from
       // here. Re-executing one re-pushes a branch that may already be merged
-      // and deleted, clobbering a successful run with 'failed'.
-      if (r.status === 'pr_ready') continue;
+      // and deleted, clobbering a successful run with 'failed'. Likewise
+      // merge_requested/merging belong to checkMergeRequests in the main loop.
+      if (r.status === 'pr_ready' || r.status === 'merge_requested' || r.status === 'merging')
+        continue;
       await executeRun(conf, tb, r, { recover: true });
     }
   } catch (err) {
@@ -428,6 +505,7 @@ async function main(): Promise<void> {
 
   for (;;) {
     try {
+      await checkMergeRequests(conf, tb);
       await checkOpenPRs(tb);
       const { runs } = await tb.queue();
       if (runs.length > 0) {
