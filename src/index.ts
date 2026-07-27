@@ -219,6 +219,33 @@ RULES
 - If you hit a decision only the user can make, output a single line starting with "QUESTION: " stating the question, then stop. You will be resumed with the answer.`;
 }
 
+/**
+ * The agent's final summary IS the PR description (the destination's
+ * AGENTS.md contract makes sessions end with a PR-ready what-was-built /
+ * tested / after-merge write-up); the fixed capture/session lines become a
+ * short footer. Falls back to the work order when a session somehow ends
+ * with no text. GitHub caps bodies at 65536 chars — truncate the summary,
+ * never the footer.
+ */
+function buildPrBody(
+  summary: string,
+  cid: string,
+  sessionId: string | null,
+  executeInstruction: string | null,
+): string {
+  const footer = [
+    '---',
+    'Built from a ThoughtBridge "bridge it" capture.',
+    '',
+    `CaptureId: ${cid}`,
+    `Session: \`claude --resume ${sessionId}\` on \`${hostname()}\``,
+  ].join('\n');
+  const body = summary.trim() || (executeInstruction ?? '').trim();
+  const budget = 65_000 - footer.length;
+  const clipped = body.length > budget ? `${body.slice(0, budget)}\n\n…(truncated)` : body;
+  return `${clipped}\n\n${footer}`;
+}
+
 async function executeRun(
   conf: Config,
   tb: TB,
@@ -267,6 +294,8 @@ async function executeRun(
     }
 
     // Session loop: run → maybe QUESTION → wait for answer → resume.
+    // The final iteration's text is the agent's summary — it becomes the PR body.
+    let finalSummary = '';
     for (;;) {
       await tb.report(cid, {
         status: 'building',
@@ -274,6 +303,7 @@ async function executeRun(
         ...(sessionId ? { sessionId } : {}),
       });
       const result = await runClaude(dir, prompt, sessionId);
+      finalSummary = result.text;
       sessionId = result.sessionId;
       await tb.report(cid, { status: 'building', sessionId, branch });
 
@@ -320,7 +350,7 @@ async function executeRun(
       '--head', branch,
       '--title', `Thought: ${run.title ?? cid}`,
       '--body',
-      `Built from a ThoughtBridge "bridge it" capture.\n\nCaptureId: ${cid}\nSession: \`claude --resume ${sessionId}\` on \`${hostname()}\`\n\n${run.executeInstruction ?? ''}`,
+      buildPrBody(finalSummary, cid, sessionId, run.executeInstruction),
     ]).trim();
 
     await tb.report(cid, { status: 'pr_ready', prUrl, sessionId, branch });
