@@ -379,7 +379,14 @@ async function checkMergeRequests(conf: Config, tb: TB): Promise<void> {
   for (const r of runs) {
     // merging = we crashed mid-merge on a previous cycle; re-enter the flow
     // (the merge prompt is idempotent — an already-merged PR just verifies).
-    if (r.status !== 'merge_requested' && r.status !== 'merging') continue;
+    // awaiting_input WITH a prUrl = a merge-flow question survived a restart
+    // (build questions never have a PR yet); pick up the wait here.
+    if (
+      r.status !== 'merge_requested' &&
+      r.status !== 'merging' &&
+      r.status !== 'awaiting_input'
+    )
+      continue;
     const cid = r.captureId;
     const capture = await tb.capture(cid);
     const run = capture['executeRun'] as
@@ -387,13 +394,13 @@ async function checkMergeRequests(conf: Config, tb: TB): Promise<void> {
       | null;
     const prUrl = run?.prUrl;
     const branch = run?.branch ?? `thought/${cid.slice(0, 8)}`;
+    if (r.status === 'awaiting_input' && !prUrl) continue; // build question — recovery owns it
     if (!prUrl || !r.repoFullName) {
       await tb.report(cid, { status: 'pr_ready', error: 'Merge request missing PR or repo' });
       continue;
     }
     console.log(`⇥ merging ${cid} — ${prUrl}`);
     try {
-      await tb.report(cid, { status: 'merging' });
       const dir = ensureCheckout(conf.workdir, r.repoFullName);
       const prompt = `The user approved the PR for this work order — merge it into the default branch now.
 
@@ -410,8 +417,40 @@ Steps:
 4. Commit the merge, push the branch, then \`gh pr merge ${prUrl} --merge --delete-branch\`.
 5. Confirm \`gh pr view ${prUrl} --json state\` reports MERGED. If the PR was already merged, that's success — say so and stop.
 
-Do NOT commit directly to the default branch. No AI attribution in commit messages.`;
-      const result = await runClaude(dir, prompt, r.sessionId ?? run?.sessionId ?? null);
+Do NOT commit directly to the default branch. No AI attribution in commit messages.
+If you hit a decision only the user can make, output a single line starting with "QUESTION: " stating the question, then stop. You will be resumed with the answer.`;
+      // Same question loop as the build flow: QUESTION → surface in the app →
+      // wait for the answer → resume the merge session.
+      let sessionId = r.sessionId ?? run?.sessionId ?? null;
+      let nextPrompt: string;
+      let cancelled = false;
+      if (r.status === 'awaiting_input') {
+        // Question already posted before the restart — just wait for the answer.
+        const answer = await waitForAnswer(tb, cid);
+        if (answer === null) continue;
+        nextPrompt = `The user answered: ${answer}\n\nContinue the merge. Same rules apply.`;
+      } else {
+        nextPrompt = prompt;
+      }
+      await tb.report(cid, { status: 'merging', ...(sessionId ? { sessionId } : {}) });
+      let result: SessionResult;
+      for (;;) {
+        result = await runClaude(dir, nextPrompt, sessionId);
+        sessionId = result.sessionId;
+        const q = QUESTION_RE.exec(result.text);
+        if (!q) break;
+        console.log(`  ? ${q[1]}`);
+        await tb.report(cid, { status: 'awaiting_input', question: q[1]!, sessionId });
+        const answer = await waitForAnswer(tb, cid);
+        if (answer === null) {
+          console.log('  merge cancelled while awaiting input');
+          cancelled = true;
+          break;
+        }
+        await tb.report(cid, { status: 'merging', sessionId });
+        nextPrompt = `The user answered: ${answer}\n\nContinue the merge. Same rules apply.`;
+      }
+      if (cancelled) continue;
       const state = sh(dir, 'gh', [
         'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
       ]).trim();
@@ -497,6 +536,13 @@ async function main(): Promise<void> {
       // merge_requested/merging belong to checkMergeRequests in the main loop.
       if (r.status === 'pr_ready' || r.status === 'merge_requested' || r.status === 'merging')
         continue;
+      if (r.status === 'awaiting_input') {
+        // A question WITH a PR attached is a merge-flow question — the
+        // merge sweep owns it. Build questions (no PR yet) resume here.
+        const capture = await tb.capture(r.captureId).catch(() => null);
+        const prUrl = (capture?.['executeRun'] as { prUrl?: string | null } | null)?.prUrl;
+        if (prUrl) continue;
+      }
       await executeRun(conf, tb, r, { recover: true });
     }
   } catch (err) {
