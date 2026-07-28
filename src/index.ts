@@ -17,6 +17,8 @@
  *   TB_AGENT_COMMAND  — optional skill/slash-command prefix (e.g. "/bee-feature").
  *                       Absent → plain prompt (the default for everyone).
  *   TB_POLL_SECONDS   — queue poll interval (default 60)
+ *   TB_MAX_SESSIONS   — max concurrent Claude sessions (default 3; always
+ *                       at most ONE session per repo checkout)
  *
  * The Claude Code SESSION stays on this machine; the run record in
  * ThoughtBridge carries (machine, sessionId) so `claude --resume <sessionId>`
@@ -41,6 +43,8 @@ interface Config {
   workdir: string;
   agentCommand: string | null;
   pollSeconds: number;
+  /** Max concurrent Claude sessions (builds + merges) across all repos. */
+  maxSessions: number;
 }
 
 function loadConfig(): Config {
@@ -69,7 +73,57 @@ function loadConfig(): Config {
     workdir: get('TB_WORKDIR') ?? join(homedir(), '.thoughtbridge-runner', 'work'),
     agentCommand: get('TB_AGENT_COMMAND') ?? null,
     pollSeconds: Number(get('TB_POLL_SECONDS') ?? 60),
+    maxSessions: Math.max(1, Number(get('TB_MAX_SESSIONS') ?? 3)),
   };
+}
+
+// ── session pool ────────────────────────────────────────────────────────────
+
+/**
+ * One Bridget session per repo, a few across the whole runner. The unit of
+ * mutual exclusion is the repo CHECKOUT (two sessions in one working tree
+ * would fight over branches), which yields one-session-per-project whenever
+ * projects live in their own repos — and safely serializes projects that
+ * share a repo (shared destinations). A run waiting on a user answer holds
+ * only its own slot; other repos keep building.
+ */
+class SessionPool {
+  private readonly busyRepos = new Set<string>();
+  private readonly active = new Map<string, Promise<void>>(); // captureId → task
+
+  constructor(private readonly maxSessions: number) {}
+
+  /** Starts [task] if the capture isn't already running, its repo is free,
+   *  and a slot is available. Returns whether it started. */
+  schedule(repo: string | null, cid: string, task: () => Promise<void>): boolean {
+    if (this.active.has(cid)) return false;
+    if (repo !== null && this.busyRepos.has(repo)) return false;
+    if (this.active.size >= this.maxSessions) return false;
+    if (repo !== null) this.busyRepos.add(repo);
+    const p = task()
+      .catch((err: unknown) =>
+        console.error(
+          `[${cid.slice(0, 8)}] unhandled: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      )
+      .finally(() => {
+        if (repo !== null) this.busyRepos.delete(repo);
+        this.active.delete(cid);
+      });
+    this.active.set(cid, p);
+    return true;
+  }
+
+  isActive(cid: string): boolean {
+    return this.active.has(cid);
+  }
+
+  /** Waits for every in-flight session to finish (used by --once). */
+  async drain(): Promise<void> {
+    while (this.active.size > 0) {
+      await Promise.race([...this.active.values()]);
+    }
+  }
 }
 
 // ── ThoughtBridge API ───────────────────────────────────────────────────────
@@ -253,8 +307,9 @@ async function executeRun(
   { recover = false }: { recover?: boolean } = {},
 ): Promise<void> {
   const cid = run.captureId;
+  const tag = `[${cid.slice(0, 8)}]`;
   console.log(
-    `${recover ? '↻ recovering' : '▶'} ${cid} — "${run.title ?? 'untitled'}" → ${run.repoFullName}`,
+    `${tag} ${recover ? '↻ recovering' : '▶'} "${run.title ?? 'untitled'}" → ${run.repoFullName}`,
   );
   if (!run.repoFullName) {
     await tb.report(cid, { status: 'failed', error: 'No repoFullName on queue entry' });
@@ -287,7 +342,7 @@ async function executeRun(
       // Re-enter the wait: the question is still open in the app.
       const answer = await waitForAnswer(tb, cid);
       if (answer === null) {
-        console.log('  run cancelled while awaiting input');
+        console.log(`${tag} run cancelled while awaiting input`);
         return;
       }
       prompt = `The user answered: ${answer}\n\nContinue the work order. Same rules apply.`;
@@ -310,11 +365,11 @@ async function executeRun(
       const q = QUESTION_RE.exec(result.text);
       if (!q) break;
 
-      console.log(`  ? ${q[1]}`);
+      console.log(`${tag} ? ${q[1]}`);
       await tb.report(cid, { status: 'awaiting_input', question: q[1]!, sessionId });
       const answer = await waitForAnswer(tb, cid);
       if (answer === null) {
-        console.log('  run cancelled while awaiting input');
+        console.log(`${tag} run cancelled while awaiting input`);
         return; // cancelled — nothing more to do
       }
       prompt = `The user answered: ${answer}\n\nContinue the work order. Same rules apply.`;
@@ -340,7 +395,7 @@ async function executeRun(
         sessionId,
         error: 'Session produced no commits — nothing to open a PR for',
       });
-      console.log('  no commits — reported done (empty)');
+      console.log(`${tag} no commits — reported done (empty)`);
       return;
     }
 
@@ -354,10 +409,10 @@ async function executeRun(
     ]).trim();
 
     await tb.report(cid, { status: 'pr_ready', prUrl, sessionId, branch });
-    console.log(`  ✔ PR ready: ${prUrl}`);
+    console.log(`${tag} ✔ PR ready: ${prUrl}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`  ✖ failed: ${message}`);
+    console.error(`${tag} ✖ failed: ${message}`);
     try {
       // Never mark a run failed when its PR actually merged — a late error
       // (e.g. pushing a branch GitHub deleted on merge) is success noise.
@@ -368,7 +423,7 @@ async function executeRun(
           'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
         ]).trim();
         if (state === 'MERGED') {
-          console.log('  PR is merged — reporting done despite the late error');
+          console.log(`${tag} PR is merged — reporting done despite the late error`);
           await tb.report(cid, { status: 'done' });
           return;
         }
@@ -404,7 +459,7 @@ async function waitForAnswer(tb: TB, captureId: string): Promise<string | null> 
  * On failure the run goes back to pr_ready with the error so the Approve
  * button reappears and the merge can be retried.
  */
-async function checkMergeRequests(conf: Config, tb: TB): Promise<void> {
+async function sweepMergeRequests(conf: Config, tb: TB, pool: SessionPool): Promise<void> {
   const { runs } = await tb.mine();
   for (const r of runs) {
     // merging = we crashed mid-merge on a previous cycle; re-enter the flow
@@ -418,6 +473,7 @@ async function checkMergeRequests(conf: Config, tb: TB): Promise<void> {
     )
       continue;
     const cid = r.captureId;
+    if (pool.isActive(cid)) continue; // its session is live right now
     const capture = await tb.capture(cid);
     const run = capture['executeRun'] as
       | { prUrl?: string | null; branch?: string | null; sessionId?: string | null }
@@ -429,9 +485,24 @@ async function checkMergeRequests(conf: Config, tb: TB): Promise<void> {
       await tb.report(cid, { status: 'pr_ready', error: 'Merge request missing PR or repo' });
       continue;
     }
-    console.log(`⇥ merging ${cid} — ${prUrl}`);
+    pool.schedule(r.repoFullName, cid, () =>
+      runMergeFlow(conf, tb, r, { prUrl, branch, sessionId: r.sessionId ?? run?.sessionId ?? null }),
+    );
+  }
+}
+
+async function runMergeFlow(
+  conf: Config,
+  tb: TB,
+  r: QueuedRun,
+  merge: { prUrl: string; branch: string; sessionId: string | null },
+): Promise<void> {
+  const cid = r.captureId;
+  const tag = `[${cid.slice(0, 8)}]`;
+  const { prUrl, branch } = merge;
+  console.log(`${tag} ⇥ merging — ${prUrl}`);
     try {
-      const dir = ensureCheckout(conf.workdir, r.repoFullName);
+      const dir = ensureCheckout(conf.workdir, r.repoFullName!);
       const prompt = `The user approved the PR for this work order — merge it into the default branch now.
 
 PR: ${prUrl}
@@ -451,13 +522,12 @@ Do NOT commit directly to the default branch. No AI attribution in commit messag
 If you hit a decision only the user can make, output a single line starting with "QUESTION: " stating the question, then stop. You will be resumed with the answer.`;
       // Same question loop as the build flow: QUESTION → surface in the app →
       // wait for the answer → resume the merge session.
-      let sessionId = r.sessionId ?? run?.sessionId ?? null;
+      let sessionId = merge.sessionId;
       let nextPrompt: string;
-      let cancelled = false;
       if (r.status === 'awaiting_input') {
         // Question already posted before the restart — just wait for the answer.
         const answer = await waitForAnswer(tb, cid);
-        if (answer === null) continue;
+        if (answer === null) return;
         nextPrompt = `The user answered: ${answer}\n\nContinue the merge. Same rules apply.`;
       } else {
         nextPrompt = prompt;
@@ -469,23 +539,21 @@ If you hit a decision only the user can make, output a single line starting with
         sessionId = result.sessionId;
         const q = QUESTION_RE.exec(result.text);
         if (!q) break;
-        console.log(`  ? ${q[1]}`);
+        console.log(`${tag} ? ${q[1]}`);
         await tb.report(cid, { status: 'awaiting_input', question: q[1]!, sessionId });
         const answer = await waitForAnswer(tb, cid);
         if (answer === null) {
-          console.log('  merge cancelled while awaiting input');
-          cancelled = true;
-          break;
+          console.log(`${tag} merge cancelled while awaiting input`);
+          return;
         }
         await tb.report(cid, { status: 'merging', sessionId });
         nextPrompt = `The user answered: ${answer}\n\nContinue the merge. Same rules apply.`;
       }
-      if (cancelled) continue;
       const state = sh(dir, 'gh', [
         'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
       ]).trim();
       if (state === 'MERGED') {
-        console.log(`  ✔ merged → done: ${prUrl}`);
+        console.log(`${tag} ✔ merged → done: ${prUrl}`);
         await tb.report(cid, { status: 'done', sessionId: result.sessionId });
       } else {
         const tail = result.text.trim().slice(-300);
@@ -493,11 +561,11 @@ If you hit a decision only the user can make, output a single line starting with
           status: 'pr_ready',
           error: `Merge attempt ended with PR still ${state}. ${tail}`.slice(0, 500),
         });
-        console.log(`  ✖ merge did not complete (PR ${state})`);
+        console.log(`${tag} ✖ merge did not complete (PR ${state})`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`  ✖ merge failed: ${message}`);
+      console.error(`${tag} ✖ merge failed: ${message}`);
       try {
         await tb.report(cid, {
           status: 'pr_ready',
@@ -507,7 +575,6 @@ If you hit a decision only the user can make, output a single line starting with
         /* run may have been cancelled */
       }
     }
-  }
 }
 
 /**
@@ -556,6 +623,8 @@ async function main(): Promise<void> {
       (conf.agentCommand ? ` (agent command: ${conf.agentCommand})` : ' (plain prompt)'),
   );
 
+  const pool = new SessionPool(conf.maxSessions);
+
   // Restart recovery: pick up runs this runner had in flight.
   try {
     const { runs: mine } = await tb.mine();
@@ -563,7 +632,7 @@ async function main(): Promise<void> {
       // pr_ready runs are DONE building — the merge-watcher owns them from
       // here. Re-executing one re-pushes a branch that may already be merged
       // and deleted, clobbering a successful run with 'failed'. Likewise
-      // merge_requested/merging belong to checkMergeRequests in the main loop.
+      // merge_requested/merging belong to sweepMergeRequests in the main loop.
       if (r.status === 'pr_ready' || r.status === 'merge_requested' || r.status === 'merging')
         continue;
       if (r.status === 'awaiting_input') {
@@ -573,7 +642,9 @@ async function main(): Promise<void> {
         const prUrl = (capture?.['executeRun'] as { prUrl?: string | null } | null)?.prUrl;
         if (prUrl) continue;
       }
-      await executeRun(conf, tb, r, { recover: true });
+      pool.schedule(r.repoFullName, r.captureId, () =>
+        executeRun(conf, tb, r, { recover: true }),
+      );
     }
   } catch (err) {
     console.error('recovery error:', err instanceof Error ? err.message : err);
@@ -581,19 +652,23 @@ async function main(): Promise<void> {
 
   for (;;) {
     try {
-      await checkMergeRequests(conf, tb);
+      await sweepMergeRequests(conf, tb, pool);
       await checkOpenPRs(tb);
+      // One session per repo, up to maxSessions across repos — oldest first.
+      // A run that can't start this tick (repo busy / pool full) just stays
+      // queued and is retried next poll.
       const { runs } = await tb.queue();
-      if (runs.length > 0) {
-        // One at a time, oldest first — a run can take a while.
-        await executeRun(conf, tb, runs[0]!);
-      } else if (once) {
-        console.log('queue empty');
+      for (const r of runs) {
+        pool.schedule(r.repoFullName, r.captureId, () => executeRun(conf, tb, r));
       }
+      if (runs.length === 0 && once) console.log('queue empty');
     } catch (err) {
       console.error('poll error:', err instanceof Error ? err.message : err);
     }
-    if (once) break;
+    if (once) {
+      await pool.drain();
+      break;
+    }
     await new Promise((r) => setTimeout(r, conf.pollSeconds * 1000));
   }
 }
