@@ -714,7 +714,7 @@ function chatPrompt(chat: PendingChat, dir: string): string {
     .map((m) => m.text)
     .join('\n\n');
   if (chat.sessionId) {
-    return `The user says:\n\n${unanswered}\n\nReply as Bridget — concise, concrete, honest. Investigate in this checkout (git, gh) when the question needs it.`;
+    return `The user says:\n\n${unanswered}\n\nReply as Bridget — concise, concrete, honest. Investigate in this checkout (git, gh) when the question needs it. Actions the repo's AGENTS.md sanctions for chat sessions may be EXECUTED when the user asks; verify outcomes with real commands and state plainly what you did versus did not do — never describe unexecuted steps as done.`;
   }
   const history = chat.messages
     .map((m) => `${m.role === 'user' ? 'User' : 'Bridget'}: ${m.text}`)
@@ -724,7 +724,9 @@ function chatPrompt(chat: PendingChat, dir: string): string {
 Your working copy of the project's repo (${chat.repoFullName}) is at ${dir} — a chat-only checkout on the default branch. You may read anything (files, git history, \`gh\` for PRs/issues/CI) to answer properly. The project's captured thoughts live under ${chat.projectSlug}/thoughtbridge/ if present.
 
 RULES
-- Do NOT commit, push, or modify the repo — this lane is for conversation and investigation only. If work is needed, say what you'd do and suggest the user capture a thought and "bridge it".
+- FIRST read the repo's AGENTS.md and any .claude/skills/ — they define what a chat session may do here, including any actions explicitly SANCTIONED for chats (e.g. a release ritual). Follow them.
+- Default is read-only: do not commit, push, or modify the repo EXCEPT actions the repo's AGENTS.md explicitly sanctions for chat sessions and the user explicitly asked for. For anything else that needs work, say what you'd do and suggest the user capture a thought and "bridge it".
+- BE HONEST ABOUT WHAT HAPPENED. Your reply must state plainly what you actually EXECUTED versus what you did NOT do. When you perform a sanctioned action, VERIFY the outcome with real commands (e.g. the tag exists on origin, the CI run started, the artifact uploaded) and report each result. If you couldn't or didn't do something, open your reply with that — never describe unexecuted steps in a way that reads as done.
 - Reply concise, concrete, honest. Plain text (light markdown fine). Your ENTIRE output is the chat reply.
 
 CONVERSATION SO FAR
