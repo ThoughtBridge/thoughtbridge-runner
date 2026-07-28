@@ -424,6 +424,25 @@ async function executeRun(
 
     const commits = sh(dir, 'git', ['rev-list', '--count', `origin/HEAD..${branch}`]).trim();
     if (commits === '0') {
+      // Multi-repo thoughts can be app-only: zero commits in THIS repo while
+      // the session opened sibling PRs elsewhere. Promote the first sibling
+      // to the run's PR so review/approve/merge work exactly as usual.
+      const orphanSibs = extractSiblingPrUrls(finalSummary, '');
+      if (orphanSibs.length > 0) {
+        const [head, ...rest] = orphanSibs;
+        await tb.report(cid, {
+          status: 'pr_ready',
+          prUrl: head!,
+          sessionId,
+          branch,
+          ...(rest.length > 0 ? { siblingPrUrls: rest } : {}),
+        });
+        console.log(
+          `${tag} ✔ no root commits — sibling PR ready: ${head}` +
+            (rest.length > 0 ? ` (+${rest.length} more)` : ''),
+        );
+        return;
+      }
       await tb.report(cid, {
         status: 'done',
         sessionId,
@@ -522,7 +541,7 @@ async function sweepMergeRequests(conf: Config, tb: TB, pool: SessionPool): Prom
     if (pool.isActive(cid)) continue; // its session is live right now
     const capture = await tb.capture(cid);
     const run = capture['executeRun'] as
-      | { prUrl?: string | null; branch?: string | null; sessionId?: string | null }
+      | { prUrl?: string | null; branch?: string | null; sessionId?: string | null; siblingPrUrls?: string[] }
       | null;
     const prUrl = run?.prUrl;
     const branch = run?.branch ?? `thought/${cid.slice(0, 8)}`;
@@ -532,7 +551,12 @@ async function sweepMergeRequests(conf: Config, tb: TB, pool: SessionPool): Prom
       continue;
     }
     pool.schedule(r.repoFullName, cid, () =>
-      runMergeFlow(conf, tb, r, { prUrl, branch, sessionId: r.sessionId ?? run?.sessionId ?? null }),
+      runMergeFlow(conf, tb, r, {
+        prUrl,
+        branch,
+        sessionId: r.sessionId ?? run?.sessionId ?? null,
+        knownSiblings: run?.siblingPrUrls ?? [],
+      }),
     );
   }
 }
@@ -558,7 +582,7 @@ async function runMergeFlow(
   conf: Config,
   tb: TB,
   r: QueuedRun,
-  merge: { prUrl: string; branch: string; sessionId: string | null },
+  merge: { prUrl: string; branch: string; sessionId: string | null; knownSiblings?: string[] },
 ): Promise<void> {
   const cid = r.captureId;
   const tag = `[${cid.slice(0, 8)}]`;
@@ -568,12 +592,13 @@ async function runMergeFlow(
       const dir = ensureCheckout(conf.workdir, r.repoFullName!);
       // One approval merges the whole thought: the root PR plus every
       // sibling PR its body lists (multi-repo bridge-it).
-      let siblingPrUrls: string[] = [];
+      let siblingPrUrls: string[] = merge.knownSiblings ?? [];
       try {
         const body = sh(dir, 'gh', ['pr', 'view', prUrl, '--json', 'body', '--jq', '.body']);
-        siblingPrUrls = extractSiblingPrUrls(body, prUrl);
+        siblingPrUrls = [...new Set([...siblingPrUrls, ...extractSiblingPrUrls(body, prUrl)])]
+          .filter((u) => u !== prUrl);
       } catch {
-        /* body unreadable — merge the root PR alone */
+        /* body unreadable — merge what we already know about */
       }
       if (siblingPrUrls.length > 0) {
         console.log(`${tag} + ${siblingPrUrls.length} sibling PR(s) to merge`);
@@ -597,6 +622,11 @@ Steps for the root PR:
    - Anything else: prefer the intent of the PR while keeping unrelated changes from the default branch.
 4. Commit the merge, push the branch, then \`gh pr merge ${prUrl} --merge --delete-branch\`.
 5. Confirm every PR (root${siblingPrUrls.length > 0 ? ' and each sibling' : ''}) reports MERGED via \`gh pr view <url> --json state\`. Already-merged PRs count as success.
+
+Note: a PR may live in a SIBLING repo rather than this checkout's repo (an
+app-only thought has no root commits). \`gh pr view/merge <url>\` work from
+anywhere; if conflict resolution needs a working tree, the sibling checkouts
+live under repos/<name> after \`./bootstrap.sh --clone-only\`.
 
 Do NOT commit directly to any default branch. No AI attribution in commit messages.
 If you hit a decision only the user can make, output a single line starting with "QUESTION: " stating the question, then stop. You will be resumed with the answer.`;
@@ -672,9 +702,12 @@ async function checkOpenPRs(tb: TB): Promise<void> {
   for (const r of runs) {
     if (r.status !== 'pr_ready') continue;
     const capture = await tb.capture(r.captureId);
-    const run = capture['executeRun'] as { prUrl?: string | null } | null;
+    const run = capture['executeRun'] as
+      | { prUrl?: string | null; siblingPrUrls?: string[] }
+      | null;
     const prUrl = run?.prUrl;
     if (!prUrl) continue;
+    const knownSiblings = run?.siblingPrUrls ?? [];
     try {
       const state = sh(process.cwd(), 'gh', [
         'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
@@ -685,7 +718,9 @@ async function checkOpenPRs(tb: TB): Promise<void> {
         const body = sh(process.cwd(), 'gh', [
           'pr', 'view', prUrl, '--json', 'body', '--jq', '.body',
         ]);
-        const openSiblings = extractSiblingPrUrls(body, prUrl).filter((u) => {
+        const openSiblings = [
+          ...new Set([...knownSiblings, ...extractSiblingPrUrls(body, prUrl)]),
+        ].filter((u) => u !== prUrl).filter((u) => {
           try {
             return prState(process.cwd(), u) !== 'MERGED';
           } catch {
