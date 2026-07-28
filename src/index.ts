@@ -738,7 +738,17 @@ async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void
   console.log(`${tag} ${chat.pendingCount} message(s) — answering…`);
   try {
     const dir = ensureCheckout(conf.workdir, chat.repoFullName, '__chat');
-    const result = await runClaude(dir, chatPrompt(chat, dir), chat.sessionId);
+    let result: SessionResult;
+    try {
+      result = await runClaude(dir, chatPrompt(chat, dir), chat.sessionId);
+    } catch (err) {
+      if (!chat.sessionId) throw err;
+      // Sessions are per-directory: a repo/destination change strands the
+      // stored id. Start fresh with the full preamble + history instead.
+      console.log(`${tag} stored session unusable — starting fresh`);
+      const fresh: PendingChat = { ...chat, sessionId: null };
+      result = await runClaude(dir, chatPrompt(fresh, dir), null);
+    }
     const text = result.text.trim() || '(Bridget had nothing to say — try rephrasing.)';
     await tb.chatReply(chat.projectId, text, result.sessionId || null, chat.pendingCount);
     console.log(`${tag} ✔ replied (${text.length} chars)`);
