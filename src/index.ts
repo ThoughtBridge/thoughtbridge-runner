@@ -525,6 +525,23 @@ async function sweepMergeRequests(conf: Config, tb: TB, pool: SessionPool): Prom
   }
 }
 
+/**
+ * Sibling PRs for a thought, read from the root PR's body (the session's
+ * final summary lists them — see thoughtbridge-root AGENTS.md). Prefers a
+ * "Sibling PRs" section when present; otherwise any GitHub PR URL in the
+ * body except the root PR itself. "Done means merged" covers ALL of them.
+ */
+function extractSiblingPrUrls(body: string, rootPrUrl: string): string[] {
+  const section = /##+\s*Sibling PRs([\s\S]*?)(?=\n##|$)/i.exec(body);
+  const haystack = section ? section[1]! : body;
+  const urls = haystack.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g) ?? [];
+  return [...new Set(urls)].filter((u) => u !== rootPrUrl);
+}
+
+function prState(cwd: string, prUrl: string): string {
+  return sh(cwd, 'gh', ['pr', 'view', prUrl, '--json', 'state', '--jq', '.state']).trim();
+}
+
 async function runMergeFlow(
   conf: Config,
   tb: TB,
@@ -537,12 +554,27 @@ async function runMergeFlow(
   console.log(`${tag} ⇥ merging — ${prUrl}`);
     try {
       const dir = ensureCheckout(conf.workdir, r.repoFullName!);
-      const prompt = `The user approved the PR for this work order — merge it into the default branch now.
+      // One approval merges the whole thought: the root PR plus every
+      // sibling PR its body lists (multi-repo bridge-it).
+      let siblingPrUrls: string[] = [];
+      try {
+        const body = sh(dir, 'gh', ['pr', 'view', prUrl, '--json', 'body', '--jq', '.body']);
+        siblingPrUrls = extractSiblingPrUrls(body, prUrl);
+      } catch {
+        /* body unreadable — merge the root PR alone */
+      }
+      if (siblingPrUrls.length > 0) {
+        console.log(`${tag} + ${siblingPrUrls.length} sibling PR(s) to merge`);
+      }
+      const siblingSection = siblingPrUrls.length > 0
+        ? `\n\nThis thought also has sibling PRs in other repos — merge EVERY one of these the same way (update from its default branch, resolve conflicts by the same rules, \`gh pr merge --merge --delete-branch\`):\n${siblingPrUrls.map((u) => `- ${u}`).join('\n')}\n`
+        : '';
+      const prompt = `The user approved this thought's work — merge its pull request(s) into their default branches now.
 
-PR: ${prUrl}
+Root PR: ${prUrl}
 Branch: ${branch}
-
-Steps:
+${siblingSection}
+Steps for the root PR:
 1. Read the PR with \`gh pr view ${prUrl}\`.
 2. \`git fetch origin\`, check out ${branch}, and merge origin's default branch into it.
 3. Resolve any conflicts:
@@ -550,9 +582,9 @@ Steps:
    - thoughts-state.json: reconcile PER ENTRY — for each thought id keep the side with the newest updatedAt; never drop entries that exist on only one side.
    - Anything else: prefer the intent of the PR while keeping unrelated changes from the default branch.
 4. Commit the merge, push the branch, then \`gh pr merge ${prUrl} --merge --delete-branch\`.
-5. Confirm \`gh pr view ${prUrl} --json state\` reports MERGED. If the PR was already merged, that's success — say so and stop.
+5. Confirm every PR (root${siblingPrUrls.length > 0 ? ' and each sibling' : ''}) reports MERGED via \`gh pr view <url> --json state\`. Already-merged PRs count as success.
 
-Do NOT commit directly to the default branch. No AI attribution in commit messages.
+Do NOT commit directly to any default branch. No AI attribution in commit messages.
 If you hit a decision only the user can make, output a single line starting with "QUESTION: " stating the question, then stop. You will be resumed with the answer.`;
       // Same question loop as the build flow: QUESTION → surface in the app →
       // wait for the answer → resume the merge session.
@@ -583,19 +615,24 @@ If you hit a decision only the user can make, output a single line starting with
         await tb.report(cid, { status: 'merging', sessionId });
         nextPrompt = `The user answered: ${answer}\n\nContinue the merge. Same rules apply.`;
       }
-      const state = sh(dir, 'gh', [
-        'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
-      ]).trim();
-      if (state === 'MERGED') {
-        console.log(`${tag} ✔ merged → done: ${prUrl}`);
+      // Done means ALL merged — the root PR and every sibling PR.
+      const unmerged = [prUrl, ...siblingPrUrls].filter((u) => {
+        try {
+          return prState(dir, u) !== 'MERGED';
+        } catch {
+          return true; // unreadable → treat as unmerged
+        }
+      });
+      if (unmerged.length === 0) {
+        console.log(`${tag} ✔ merged (root + ${siblingPrUrls.length} sibling) → done`);
         await tb.report(cid, { status: 'done', sessionId: result.sessionId });
       } else {
-        const tail = result.text.trim().slice(-300);
+        const tail = result.text.trim().slice(-200);
         await tb.report(cid, {
           status: 'pr_ready',
-          error: `Merge attempt ended with PR still ${state}. ${tail}`.slice(0, 500),
+          error: `Still unmerged: ${unmerged.join(', ')}. ${tail}`.slice(0, 500),
         });
-        console.log(`${tag} ✖ merge did not complete (PR ${state})`);
+        console.log(`${tag} ✖ merge incomplete — still open: ${unmerged.join(', ')}`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -629,6 +666,24 @@ async function checkOpenPRs(tb: TB): Promise<void> {
         'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
       ]).trim();
       if (state === 'MERGED') {
+        // Done means ALL merged: a hand-merged root PR only completes the
+        // thought once its sibling PRs (listed in the body) are merged too.
+        const body = sh(process.cwd(), 'gh', [
+          'pr', 'view', prUrl, '--json', 'body', '--jq', '.body',
+        ]);
+        const openSiblings = extractSiblingPrUrls(body, prUrl).filter((u) => {
+          try {
+            return prState(process.cwd(), u) !== 'MERGED';
+          } catch {
+            return true;
+          }
+        });
+        if (openSiblings.length > 0) {
+          console.log(
+            `  root PR merged but sibling PR(s) still open (${openSiblings.join(', ')}) — waiting`,
+          );
+          continue;
+        }
         console.log(`  ✔ PR merged → done: ${prUrl}`);
         await tb.report(r.captureId, { status: 'done' });
       } else if (state === 'CLOSED') {
