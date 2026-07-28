@@ -442,8 +442,20 @@ async function executeRun(
       buildPrBody(finalSummary, cid, sessionId, run.executeInstruction),
     ]).trim();
 
-    await tb.report(cid, { status: 'pr_ready', prUrl, sessionId, branch });
-    console.log(`${tag} ✔ PR ready: ${prUrl}`);
+    // Sibling PRs the session opened (multi-repo bridge-it) ride the run
+    // record so the app can list every PR, not just the root one.
+    const siblingPrUrls = extractSiblingPrUrls(finalSummary, prUrl);
+    await tb.report(cid, {
+      status: 'pr_ready',
+      prUrl,
+      sessionId,
+      branch,
+      ...(siblingPrUrls.length > 0 ? { siblingPrUrls } : {}),
+    });
+    console.log(
+      `${tag} ✔ PR ready: ${prUrl}` +
+        (siblingPrUrls.length > 0 ? ` (+${siblingPrUrls.length} sibling)` : ''),
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`${tag} ✖ failed: ${message}`);
@@ -565,6 +577,8 @@ async function runMergeFlow(
       }
       if (siblingPrUrls.length > 0) {
         console.log(`${tag} + ${siblingPrUrls.length} sibling PR(s) to merge`);
+        // Backfill the run record for runs reported before siblings existed.
+        await tb.report(cid, { siblingPrUrls }).catch(() => {});
       }
       const siblingSection = siblingPrUrls.length > 0
         ? `\n\nThis thought also has sibling PRs in other repos — merge EVERY one of these the same way (update from its default branch, resolve conflicts by the same rules, \`gh pr merge --merge --delete-branch\`):\n${siblingPrUrls.map((u) => `- ${u}`).join('\n')}\n`
