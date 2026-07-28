@@ -181,6 +181,40 @@ class TB {
   capture(captureId: string): Promise<Record<string, unknown>> {
     return this.call('GET', `/captures/${captureId}`);
   }
+  chats(): Promise<{ chats: PendingChat[] }> {
+    return this.call('GET', '/runner/chats');
+  }
+  chatReply(
+    projectId: string,
+    text: string,
+    sessionId: string | null,
+    answeredCount: number,
+  ): Promise<unknown> {
+    return this.call('POST', `/runner/chats/${projectId}/reply`, {
+      runnerId: this.conf.runnerId,
+      text,
+      sessionId,
+      machine: hostname(),
+      answeredCount,
+    });
+  }
+}
+
+interface ChatMessage {
+  messageId: string;
+  role: 'user' | 'bridget';
+  text: string;
+  createdAt: string;
+}
+
+interface PendingChat {
+  projectId: string;
+  projectName: string;
+  projectSlug: string;
+  repoFullName: string;
+  sessionId: string | null;
+  messages: ChatMessage[];
+  pendingCount: number;
 }
 
 // ── git / claude helpers ────────────────────────────────────────────────────
@@ -203,8 +237,8 @@ async function shAsync(
   });
 }
 
-function ensureCheckout(workdir: string, repoFullName: string): string {
-  const dir = join(workdir, repoFullName.replace('/', '__'));
+function ensureCheckout(workdir: string, repoFullName: string, suffix = ''): string {
+  const dir = join(workdir, repoFullName.replace('/', '__') + suffix);
   if (!existsSync(dir)) {
     console.log(`  cloning ${repoFullName}…`);
     sh(workdir, 'gh', ['repo', 'clone', repoFullName, dir]);
@@ -610,6 +644,75 @@ async function checkOpenPRs(tb: TB): Promise<void> {
   }
 }
 
+// ── project chat lane ───────────────────────────────────────────────────────
+// Completely separate from the build SessionPool: chats never consume build
+// slots and builds never delay a chat. One conversation per project at a
+// time; the session lives in a chat-only checkout (`<repo>__chat`) so it
+// never touches a build tree mid-branch.
+
+const activeChats = new Set<string>();
+
+function chatPrompt(chat: PendingChat, dir: string): string {
+  const unanswered = chat.messages
+    .slice(-Math.max(chat.pendingCount, 1))
+    .filter((m) => m.role === 'user')
+    .map((m) => m.text)
+    .join('\n\n');
+  if (chat.sessionId) {
+    return `The user says:\n\n${unanswered}\n\nReply as Bridget — concise, concrete, honest. Investigate in this checkout (git, gh) when the question needs it.`;
+  }
+  const history = chat.messages
+    .map((m) => `${m.role === 'user' ? 'User' : 'Bridget'}: ${m.text}`)
+    .join('\n');
+  return `You are Bridget, the ThoughtBridge agent for the project "${chat.projectName}". The user is chatting with you about this project from the ThoughtBridge app.
+
+Your working copy of the project's repo (${chat.repoFullName}) is at ${dir} — a chat-only checkout on the default branch. You may read anything (files, git history, \`gh\` for PRs/issues/CI) to answer properly. The project's captured thoughts live under ${chat.projectSlug}/thoughtbridge/ if present.
+
+RULES
+- Do NOT commit, push, or modify the repo — this lane is for conversation and investigation only. If work is needed, say what you'd do and suggest the user capture a thought and "bridge it".
+- Reply concise, concrete, honest. Plain text (light markdown fine). Your ENTIRE output is the chat reply.
+
+CONVERSATION SO FAR
+${history}
+
+Reply to the user's latest message(s).`;
+}
+
+async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void> {
+  const tag = `[chat:${chat.projectSlug}]`;
+  console.log(`${tag} ${chat.pendingCount} message(s) — answering…`);
+  try {
+    const dir = ensureCheckout(conf.workdir, chat.repoFullName, '__chat');
+    const result = await runClaude(dir, chatPrompt(chat, dir), chat.sessionId);
+    const text = result.text.trim() || '(Bridget had nothing to say — try rephrasing.)';
+    await tb.chatReply(chat.projectId, text, result.sessionId || null, chat.pendingCount);
+    console.log(`${tag} ✔ replied (${text.length} chars)`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`${tag} ✖ ${message}`);
+    // Best-effort error reply so the user isn't left waiting on silence.
+    try {
+      await tb.chatReply(
+        chat.projectId,
+        `Bridget hit an error answering this: ${message.slice(0, 300)} — send your message again to retry.`,
+        chat.sessionId,
+        chat.pendingCount,
+      );
+    } catch {
+      /* next sweep retries */
+    }
+  }
+}
+
+async function sweepChats(conf: Config, tb: TB): Promise<void> {
+  const { chats } = await tb.chats();
+  for (const c of chats) {
+    if (activeChats.has(c.projectId)) continue;
+    activeChats.add(c.projectId);
+    void answerChat(conf, tb, c).finally(() => activeChats.delete(c.projectId));
+  }
+}
+
 // ── main loop ───────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -624,6 +727,21 @@ async function main(): Promise<void> {
   );
 
   const pool = new SessionPool(conf.maxSessions);
+
+  // Chat lane: its own faster poll (10s) so conversations feel responsive —
+  // fully independent of the build queue and TB_MAX_SESSIONS.
+  if (!once) {
+    void (async () => {
+      for (;;) {
+        try {
+          await sweepChats(conf, tb);
+        } catch (err) {
+          console.error('chat poll error:', err instanceof Error ? err.message : err);
+        }
+        await new Promise((r) => setTimeout(r, 10_000));
+      }
+    })();
+  }
 
   // Restart recovery: pick up runs this runner had in flight.
   try {
@@ -666,6 +784,8 @@ async function main(): Promise<void> {
       console.error('poll error:', err instanceof Error ? err.message : err);
     }
     if (once) {
+      await sweepChats(conf, tb).catch(() => {});
+      while (activeChats.size > 0) await new Promise((r) => setTimeout(r, 500));
       await pool.drain();
       break;
     }
