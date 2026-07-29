@@ -36,6 +36,7 @@ Config via env or `~/.thoughtbridge-runner.json`:
 | `TB_RUNNER_ID` | `runner-<hostname>` | stable id shown on the run |
 | `TB_WORKDIR` | `~/.thoughtbridge-runner/work` | where repos are cloned |
 | `TB_AGENT_COMMAND` | *(none — plain prompt)* | your own skill/slash command, e.g. `/my-orchestrator`. The runner invokes it with the thought and steps back. |
+| `TB_MODEL` | *(none — claude's default)* | model for every session the runner drives, passed to `claude` as `--model`. An alias (`sonnet`, `opus`, `fable`, `haiku`) or a full model name (`claude-sonnet-5`). Unset, sessions use whatever this machine's Claude Code config selects — the runner logs the effective setting at startup. |
 | `TB_POLL_SECONDS` | `60` | queue poll interval |
 
 ## How a run works

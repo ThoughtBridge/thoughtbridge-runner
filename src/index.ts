@@ -16,6 +16,11 @@
  *   TB_WORKDIR        — where repos are cloned (default ~/.thoughtbridge-runner/work)
  *   TB_AGENT_COMMAND  — optional skill/slash-command prefix (e.g. "/bee-feature").
  *                       Absent → plain prompt (the default for everyone).
+ *   TB_MODEL          — model for every Claude session the runner drives.
+ *                       An alias ("sonnet", "opus", "fable", "haiku") or a full
+ *                       model name ("claude-sonnet-5"), passed to claude as
+ *                       --model. Absent → the claude CLI's own default (whatever
+ *                       this machine's Claude Code config selects).
  *   TB_POLL_SECONDS   — queue poll interval (default 60)
  *   TB_MAX_SESSIONS   — max concurrent Claude sessions (default 3; always
  *                       at most ONE session per repo checkout)
@@ -42,6 +47,8 @@ interface Config {
   runnerId: string;
   workdir: string;
   agentCommand: string | null;
+  /** Model passed to claude as --model; null → the CLI's configured default. */
+  model: string | null;
   pollSeconds: number;
   /** Max concurrent Claude sessions (builds + merges) across all repos. */
   maxSessions: number;
@@ -72,6 +79,7 @@ function loadConfig(): Config {
     runnerId: get('TB_RUNNER_ID') ?? `runner-${hostname()}`,
     workdir: get('TB_WORKDIR') ?? join(homedir(), '.thoughtbridge-runner', 'work'),
     agentCommand: get('TB_AGENT_COMMAND') ?? null,
+    model: get('TB_MODEL') ?? null,
     pollSeconds: Number(get('TB_POLL_SECONDS') ?? 60),
     maxSessions: Math.max(1, Number(get('TB_MAX_SESSIONS') ?? 3)),
   };
@@ -264,6 +272,7 @@ async function runClaude(
   cwd: string,
   prompt: string,
   resumeSessionId: string | null,
+  model: string | null,
 ): Promise<SessionResult> {
   // Autonomous by definition: the session runs headless in the runner's own
   // checkout, so nobody is present to approve tool calls. Without this flag
@@ -273,6 +282,7 @@ async function runClaude(
     '--output-format', 'json',
     '--dangerously-skip-permissions',
   ];
+  if (model) args.push('--model', model);
   if (resumeSessionId) args.unshift('--resume', resumeSessionId);
   const { stdout } = await shAsync(cwd, 'claude', args, 45 * 60_000);
   const parsed = JSON.parse(stdout) as { session_id?: string; result?: string };
@@ -391,7 +401,7 @@ async function executeRun(
         ...(sessionId ? {} : { branch }),
         ...(sessionId ? { sessionId } : {}),
       });
-      const result = await runClaude(dir, prompt, sessionId);
+      const result = await runClaude(dir, prompt, sessionId, conf.model);
       finalSummary = result.text;
       sessionId = result.sessionId;
       await tb.report(cid, { status: 'building', sessionId, branch });
@@ -645,7 +655,7 @@ If you hit a decision only the user can make, output a single line starting with
       await tb.report(cid, { status: 'merging', ...(sessionId ? { sessionId } : {}) });
       let result: SessionResult;
       for (;;) {
-        result = await runClaude(dir, nextPrompt, sessionId);
+        result = await runClaude(dir, nextPrompt, sessionId, conf.model);
         sessionId = result.sessionId;
         const q = QUESTION_RE.exec(result.text);
         if (!q) break;
@@ -791,14 +801,14 @@ async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void
     const dir = ensureCheckout(conf.workdir, chat.repoFullName, '__chat');
     let result: SessionResult;
     try {
-      result = await runClaude(dir, chatPrompt(chat, dir), chat.sessionId);
+      result = await runClaude(dir, chatPrompt(chat, dir), chat.sessionId, conf.model);
     } catch (err) {
       if (!chat.sessionId) throw err;
       // Sessions are per-directory: a repo/destination change strands the
       // stored id. Start fresh with the full preamble + history instead.
       console.log(`${tag} stored session unusable — starting fresh`);
       const fresh: PendingChat = { ...chat, sessionId: null };
-      result = await runClaude(dir, chatPrompt(fresh, dir), null);
+      result = await runClaude(dir, chatPrompt(fresh, dir), null, conf.model);
     }
     const text = result.text.trim() || '(Bridget had nothing to say — try rephrasing.)';
     await tb.chatReply(chat.projectId, text, result.sessionId || null, chat.pendingCount);
@@ -839,7 +849,8 @@ async function main(): Promise<void> {
 
   console.log(
     `thoughtbridge-runner ${conf.runnerId} on ${hostname()}` +
-      (conf.agentCommand ? ` (agent command: ${conf.agentCommand})` : ' (plain prompt)'),
+      (conf.agentCommand ? ` (agent command: ${conf.agentCommand})` : ' (plain prompt)') +
+      ` (model: ${conf.model ?? 'claude default'})`,
   );
 
   const pool = new SessionPool(conf.maxSessions);
