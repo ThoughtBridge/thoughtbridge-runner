@@ -430,12 +430,14 @@ async function executeRun(
       const orphanSibs = extractSiblingPrUrls(finalSummary, '');
       if (orphanSibs.length > 0) {
         const [head, ...rest] = orphanSibs;
+        const orphanSteps = extractAfterMergeSteps(finalSummary);
         await tb.report(cid, {
           status: 'pr_ready',
           prUrl: head!,
           sessionId,
           branch,
           ...(rest.length > 0 ? { siblingPrUrls: rest } : {}),
+          ...(orphanSteps ? { postMergeSteps: orphanSteps } : {}),
         });
         console.log(
           `${tag} ✔ no root commits — sibling PR ready: ${head}` +
@@ -464,12 +466,14 @@ async function executeRun(
     // Sibling PRs the session opened (multi-repo bridge-it) ride the run
     // record so the app can list every PR, not just the root one.
     const siblingPrUrls = extractSiblingPrUrls(finalSummary, prUrl);
+    const postMergeSteps = extractAfterMergeSteps(finalSummary);
     await tb.report(cid, {
       status: 'pr_ready',
       prUrl,
       sessionId,
       branch,
       ...(siblingPrUrls.length > 0 ? { siblingPrUrls } : {}),
+      ...(postMergeSteps ? { postMergeSteps } : {}),
     });
     console.log(
       `${tag} ✔ PR ready: ${prUrl}` +
@@ -572,6 +576,18 @@ function extractSiblingPrUrls(body: string, rootPrUrl: string): string[] {
   const haystack = section ? section[1]! : body;
   const urls = haystack.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g) ?? [];
   return [...new Set(urls)].filter((u) => u !== rootPrUrl);
+}
+
+/**
+ * The "## After merge" section of the session summary — the manual steps the
+ * user must perform after merging (restart the runner, tag a release, …).
+ * Shown in the app BEFORE approval. Empty when absent or "None."
+ */
+function extractAfterMergeSteps(summary: string): string | null {
+  const m = /##+\s*After merge([\s\S]*?)(?=\n##|$)/i.exec(summary);
+  const text = m?.[1]?.trim() ?? '';
+  if (!text || /^_?\s*none\.?\s*_?$/i.test(text)) return null;
+  return text.slice(0, 2000);
 }
 
 function prState(cwd: string, prUrl: string): string {
