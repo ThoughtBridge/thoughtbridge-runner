@@ -12,7 +12,10 @@
  * Config (env or ~/.thoughtbridge-runner.json):
  *   TB_API_URL        — default https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1
  *   TB_API_KEY        — a `runner`-scoped ThoughtBridge API key (required)
- *   TB_RUNNER_ID      — stable id for this runner (default: runner-<hostname>)
+ *   TB_RUNNER_ID      — stable id for this runner (default: runner-<hostname>).
+ *                       Registered in your account's runner registry at startup;
+ *                       the app lists instances and can pin a project's
+ *                       bridge-it work to one of them.
  *   TB_WORKDIR        — where repos are cloned (default ~/.thoughtbridge-runner/work)
  *   TB_AGENT_COMMAND  — optional skill/slash-command prefix (e.g. "/bee-feature").
  *                       Absent → plain prompt (the default for everyone).
@@ -167,8 +170,28 @@ class TB {
     return (await res.json()) as T;
   }
 
+  /**
+   * Startup registration: lands this instance in the account's runner
+   * registry so the app can list it and pin projects to it. Best-effort —
+   * an older API without the endpoint must not stop the runner.
+   */
+  async register(): Promise<void> {
+    try {
+      await this.call('POST', '/runner/register', {
+        runnerId: this.conf.runnerId,
+        machine: hostname(),
+      });
+      console.log(`registered as ${this.conf.runnerId} in the runner registry`);
+    } catch (err) {
+      console.error(
+        `warning: runner registration failed (older API?): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   queue(): Promise<{ runs: QueuedRun[] }> {
-    return this.call('GET', '/runner/queue');
+    // runnerId identifies this instance: heartbeat for the registry, and the
+    // server hides runs for projects pinned to a different runner.
+    return this.call('GET', `/runner/queue?runnerId=${encodeURIComponent(this.conf.runnerId)}`);
   }
   /** In-flight runs claimed by THIS runner — restart recovery. */
   mine(): Promise<{ runs: QueuedRun[] }> {
@@ -190,7 +213,7 @@ class TB {
     return this.call('GET', `/captures/${captureId}`);
   }
   chats(): Promise<{ chats: PendingChat[] }> {
-    return this.call('GET', '/runner/chats');
+    return this.call('GET', `/runner/chats?runnerId=${encodeURIComponent(this.conf.runnerId)}`);
   }
   chatReply(
     projectId: string,
@@ -868,6 +891,10 @@ async function main(): Promise<void> {
       (conf.agentCommand ? ` (agent command: ${conf.agentCommand})` : ' (plain prompt)') +
       ` (model: ${conf.model ?? 'claude default'})`,
   );
+
+  // Announce this instance to the account's runner registry (multi-instance:
+  // the app lists registered runners and can pin a project to one).
+  await tb.register();
 
   const pool = new SessionPool(conf.maxSessions);
 
