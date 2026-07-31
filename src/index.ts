@@ -478,10 +478,15 @@ async function executeRun(
         );
         return;
       }
+      // Surface WHY in the app: the session's own closing words are the
+      // only explanation the user gets (resume hint included for digging).
+      const summaryTail = finalSummary.trim().slice(0, 350);
       await tb.report(cid, {
         status: 'done',
         sessionId,
-        error: 'Session produced no commits — nothing to open a PR for',
+        error:
+          `Session produced no commits — nothing to open a PR for. ` +
+          `Bridget's last words: "${summaryTail}" — resume with: cd ${dir} && claude --resume ${sessionId}`,
       });
       console.log(`${tag} no commits — reported done (empty)`);
       return;
