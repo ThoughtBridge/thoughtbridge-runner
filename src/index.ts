@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * thoughtbridge-runner — the self-hosted bridge-it runner.
+ * thoughtbridge-runner - the self-hosted bridge-it runner.
  *
  * Polls your ThoughtBridge account for thoughts you ended with "bridge it",
  * checks out the project's GitHub repo, drives a Claude Code session to build
@@ -10,22 +10,22 @@
  * Requirements on this machine: git, gh (authenticated), claude (Claude Code).
  *
  * Config (env or ~/.thoughtbridge-runner.json):
- *   TB_API_URL        — default https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1
- *   TB_API_KEY        — a `runner`-scoped ThoughtBridge API key (required)
- *   TB_RUNNER_ID      — stable id for this runner (default: runner-<hostname>).
+ *   TB_API_URL        - default https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1
+ *   TB_API_KEY        - a `runner`-scoped ThoughtBridge API key (required)
+ *   TB_RUNNER_ID      - stable id for this runner (default: runner-<hostname>).
  *                       Registered in your account's runner registry at startup;
  *                       the app lists instances and can pin a project's
  *                       bridge-it work to one of them.
- *   TB_WORKDIR        — where repos are cloned (default ~/.thoughtbridge-runner/work)
- *   TB_AGENT_COMMAND  — optional skill/slash-command prefix (e.g. "/bee-feature").
+ *   TB_WORKDIR        - where repos are cloned (default ~/.thoughtbridge-runner/work)
+ *   TB_AGENT_COMMAND  - optional skill/slash-command prefix (e.g. "/bee-feature").
  *                       Absent → plain prompt (the default for everyone).
- *   TB_MODEL          — model for every Claude session the runner drives.
+ *   TB_MODEL          - model for every Claude session the runner drives.
  *                       An alias ("sonnet", "opus", "fable", "haiku") or a full
  *                       model name ("claude-sonnet-5"), passed to claude as
  *                       --model. Absent → the claude CLI's own default (whatever
  *                       this machine's Claude Code config selects).
- *   TB_POLL_SECONDS   — queue poll interval (default 60)
- *   TB_MAX_SESSIONS   — max concurrent Claude sessions (default 3; always
+ *   TB_POLL_SECONDS   - queue poll interval (default 60)
+ *   TB_MAX_SESSIONS   - max concurrent Claude sessions (default 3; always
  *                       at most ONE session per repo checkout)
  *
  * The Claude Code SESSION stays on this machine; the run record in
@@ -64,7 +64,7 @@ function loadConfig(): Config {
     try {
       fileConf = JSON.parse(readFileSync(confPath, 'utf8')) as Record<string, string>;
     } catch {
-      console.error(`warning: could not parse ${confPath} — ignoring`);
+      console.error(`warning: could not parse ${confPath} - ignoring`);
     }
   }
   const get = (key: string): string | undefined => process.env[key] ?? fileConf[key];
@@ -94,7 +94,7 @@ function loadConfig(): Config {
  * One Bridget session per repo, a few across the whole runner. The unit of
  * mutual exclusion is the repo CHECKOUT (two sessions in one working tree
  * would fight over branches), which yields one-session-per-project whenever
- * projects live in their own repos — and safely serializes projects that
+ * projects live in their own repos - and safely serializes projects that
  * share a repo (shared destinations). A run waiting on a user answer holds
  * only its own slot; other repos keep building.
  */
@@ -172,7 +172,7 @@ class TB {
 
   /**
    * Startup registration: lands this instance in the account's runner
-   * registry so the app can list it and pin projects to it. Best-effort —
+   * registry so the app can list it and pin projects to it. Best-effort -
    * an older API without the endpoint must not stop the runner.
    */
   async register(): Promise<void> {
@@ -193,7 +193,7 @@ class TB {
     // server hides runs for projects pinned to a different runner.
     return this.call('GET', `/runner/queue?runnerId=${encodeURIComponent(this.conf.runnerId)}`);
   }
-  /** In-flight runs claimed by THIS runner — restart recovery. */
+  /** In-flight runs claimed by THIS runner - restart recovery. */
   mine(): Promise<{ runs: QueuedRun[] }> {
     return this.call('GET', `/runner/queue?mine=${encodeURIComponent(this.conf.runnerId)}`);
   }
@@ -333,10 +333,11 @@ FULL THOUGHT
 ${captureMarkdown}
 
 RULES
-- You are on branch ${branch} — stay on it. NEVER commit to the default branch.
-- This repo's own agent files (AGENTS.md, .thoughtbridge/THOUGHTBRIDGE.md) describe its layout and conventions — read them first and follow them.
+- You are on branch ${branch} - stay on it. NEVER commit to the default branch.
+- This repo's own agent files (AGENTS.md, .thoughtbridge/THOUGHTBRIDGE.md) describe its layout and conventions - read them first and follow them.
 - Implement the work order completely: code, tests if the repo has a test setup, and a short summary of what you did as your final message.
 - Commit your work with clear messages (no AI attribution trailers).
+- Never use em dashes or en dashes in anything you write (code comments, docs, commit messages, your summary). Use a comma, colon, or plain hyphen instead.
 - If you hit a decision only the user can make, output a single line starting with "QUESTION: " stating the question, then stop. You will be resumed with the answer.`;
 }
 
@@ -345,7 +346,7 @@ RULES
  * AGENTS.md contract makes sessions end with a PR-ready what-was-built /
  * tested / after-merge write-up); the fixed capture/session lines become a
  * short footer. Falls back to the work order when a session somehow ends
- * with no text. GitHub caps bodies at 65536 chars — truncate the summary,
+ * with no text. GitHub caps bodies at 65536 chars - truncate the summary,
  * never the footer.
  */
 function buildPrBody(
@@ -391,7 +392,7 @@ async function executeRun(
       ? join(conf.workdir, run.repoFullName.replace('/', '__'))
       : ensureCheckout(conf.workdir, run.repoFullName);
     if (recover && !existsSync(dir)) {
-      throw new Error('Checkout missing after restart — cancel and re-bridge this thought');
+      throw new Error('Checkout missing after restart - cancel and re-bridge this thought');
     }
     sh(dir, 'git', ['checkout', recover ? branch : '-B', ...(recover ? [] : [branch])]);
 
@@ -403,7 +404,7 @@ async function executeRun(
 
     let sessionId: string | null = recover ? run.sessionId : null;
     let prompt = recover && sessionId
-      ? 'The runner restarted. Continue the work order from where you left off — if it is already complete, summarise what was done. Same rules apply.'
+      ? 'The runner restarted. Continue the work order from where you left off - if it is already complete, summarise what was done. Same rules apply.'
       : buildPrompt(conf, run, markdown, branch);
     if (recover && run.status === 'awaiting_input') {
       // Re-enter the wait: the question is still open in the app.
@@ -416,7 +417,7 @@ async function executeRun(
     }
 
     // Session loop: run → maybe QUESTION → wait for answer → resume.
-    // The final iteration's text is the agent's summary — it becomes the PR body.
+    // The final iteration's text is the agent's summary - it becomes the PR body.
     let finalSummary = '';
     for (;;) {
       await tb.report(cid, {
@@ -437,7 +438,7 @@ async function executeRun(
       const answer = await waitForAnswer(tb, cid);
       if (answer === null) {
         console.log(`${tag} run cancelled while awaiting input`);
-        return; // cancelled — nothing more to do
+        return; // cancelled - nothing more to do
       }
       prompt = `The user answered: ${answer}\n\nContinue the work order. Same rules apply.`;
     }
@@ -473,7 +474,7 @@ async function executeRun(
           ...(orphanSteps ? { postMergeSteps: orphanSteps } : {}),
         });
         console.log(
-          `${tag} ✔ no root commits — sibling PR ready: ${head}` +
+          `${tag} ✔ no root commits - sibling PR ready: ${head}` +
             (rest.length > 0 ? ` (+${rest.length} more)` : ''),
         );
         return;
@@ -485,10 +486,10 @@ async function executeRun(
         status: 'done',
         sessionId,
         error:
-          `Session produced no commits — nothing to open a PR for. ` +
-          `Bridget's last words: "${summaryTail}" — resume with: cd ${dir} && claude --resume ${sessionId}`,
+          `Session produced no commits - nothing to open a PR for. ` +
+          `Bridget's last words: "${summaryTail}" - resume with: cd ${dir} && claude --resume ${sessionId}`,
       });
-      console.log(`${tag} no commits — reported done (empty)`);
+      console.log(`${tag} no commits - reported done (empty)`);
       return;
     }
 
@@ -521,7 +522,7 @@ async function executeRun(
     const message = err instanceof Error ? err.message : String(err);
     console.error(`${tag} ✖ failed: ${message}`);
     try {
-      // Never mark a run failed when its PR actually merged — a late error
+      // Never mark a run failed when its PR actually merged - a late error
       // (e.g. pushing a branch GitHub deleted on merge) is success noise.
       const capture = await tb.capture(cid).catch(() => null);
       const prUrl = (capture?.['executeRun'] as { prUrl?: string | null } | null)?.prUrl;
@@ -530,14 +531,14 @@ async function executeRun(
           'pr', 'view', prUrl, '--json', 'state', '--jq', '.state',
         ]).trim();
         if (state === 'MERGED') {
-          console.log(`${tag} PR is merged — reporting done despite the late error`);
+          console.log(`${tag} PR is merged - reporting done despite the late error`);
           await tb.report(cid, { status: 'done' });
           return;
         }
       }
       await tb.report(cid, { status: 'failed', error: message.slice(0, 500) });
     } catch {
-      /* run may have been cancelled — nothing to report onto */
+      /* run may have been cancelled - nothing to report onto */
     }
   }
 }
@@ -570,7 +571,7 @@ async function sweepMergeRequests(conf: Config, tb: TB, pool: SessionPool): Prom
   const { runs } = await tb.mine();
   for (const r of runs) {
     // merging = we crashed mid-merge on a previous cycle; re-enter the flow
-    // (the merge prompt is idempotent — an already-merged PR just verifies).
+    // (the merge prompt is idempotent - an already-merged PR just verifies).
     // awaiting_input WITH a prUrl = a merge-flow question survived a restart
     // (build questions never have a PR yet); pick up the wait here.
     if (
@@ -587,7 +588,7 @@ async function sweepMergeRequests(conf: Config, tb: TB, pool: SessionPool): Prom
       | null;
     const prUrl = run?.prUrl;
     const branch = run?.branch ?? `thought/${cid.slice(0, 8)}`;
-    if (r.status === 'awaiting_input' && !prUrl) continue; // build question — recovery owns it
+    if (r.status === 'awaiting_input' && !prUrl) continue; // build question - recovery owns it
     if (!prUrl || !r.repoFullName) {
       await tb.report(cid, { status: 'pr_ready', error: 'Merge request missing PR or repo' });
       continue;
@@ -605,7 +606,7 @@ async function sweepMergeRequests(conf: Config, tb: TB, pool: SessionPool): Prom
 
 /**
  * Sibling PRs for a thought, read from the root PR's body (the session's
- * final summary lists them — see thoughtbridge-root AGENTS.md). Prefers a
+ * final summary lists them - see thoughtbridge-root AGENTS.md). Prefers a
  * "Sibling PRs" section when present; otherwise any GitHub PR URL in the
  * body except the root PR itself. "Done means merged" covers ALL of them.
  */
@@ -617,7 +618,7 @@ function extractSiblingPrUrls(body: string, rootPrUrl: string): string[] {
 }
 
 /**
- * The "## After merge" section of the session summary — the manual steps the
+ * The "## After merge" section of the session summary - the manual steps the
  * user must perform after merging (restart the runner, tag a release, …).
  * Shown in the app BEFORE approval. Empty when absent or "None."
  */
@@ -641,7 +642,7 @@ async function runMergeFlow(
   const cid = r.captureId;
   const tag = `[${cid.slice(0, 8)}]`;
   const { prUrl, branch } = merge;
-  console.log(`${tag} ⇥ merging — ${prUrl}`);
+  console.log(`${tag} ⇥ merging - ${prUrl}`);
     try {
       const dir = ensureCheckout(conf.workdir, r.repoFullName!);
       // One approval merges the whole thought: the root PR plus every
@@ -652,7 +653,7 @@ async function runMergeFlow(
         siblingPrUrls = [...new Set([...siblingPrUrls, ...extractSiblingPrUrls(body, prUrl)])]
           .filter((u) => u !== prUrl);
       } catch {
-        /* body unreadable — merge what we already know about */
+        /* body unreadable - merge what we already know about */
       }
       if (siblingPrUrls.length > 0) {
         console.log(`${tag} + ${siblingPrUrls.length} sibling PR(s) to merge`);
@@ -660,9 +661,9 @@ async function runMergeFlow(
         await tb.report(cid, { siblingPrUrls }).catch(() => {});
       }
       const siblingSection = siblingPrUrls.length > 0
-        ? `\n\nThis thought also has sibling PRs in other repos — merge EVERY one of these the same way (update from its default branch, resolve conflicts by the same rules, \`gh pr merge --merge --delete-branch\`):\n${siblingPrUrls.map((u) => `- ${u}`).join('\n')}\n`
+        ? `\n\nThis thought also has sibling PRs in other repos - merge EVERY one of these the same way (update from its default branch, resolve conflicts by the same rules, \`gh pr merge --merge --delete-branch\`):\n${siblingPrUrls.map((u) => `- ${u}`).join('\n')}\n`
         : '';
-      const prompt = `The user approved this thought's work — merge its pull request(s) into their default branches now.
+      const prompt = `The user approved this thought's work - merge its pull request(s) into their default branches now.
 
 Root PR: ${prUrl}
 Branch: ${branch}
@@ -671,8 +672,8 @@ Steps for the root PR:
 1. Read the PR with \`gh pr view ${prUrl}\`.
 2. \`git fetch origin\`, check out ${branch}, and merge origin's default branch into it.
 3. Resolve any conflicts:
-   - Agent/instruction files (AGENTS.md, CLAUDE.md, tasks/*.md): union both sides — keep everyone's entries.
-   - thoughts-state.json: reconcile PER ENTRY — for each thought id keep the side with the newest updatedAt; never drop entries that exist on only one side.
+   - Agent/instruction files (AGENTS.md, CLAUDE.md, tasks/*.md): union both sides - keep everyone's entries.
+   - thoughts-state.json: reconcile PER ENTRY - for each thought id keep the side with the newest updatedAt; never drop entries that exist on only one side.
    - Anything else: prefer the intent of the PR while keeping unrelated changes from the default branch.
 4. Commit the merge, push the branch, then \`gh pr merge ${prUrl} --merge --delete-branch\`.
 5. Confirm every PR (root${siblingPrUrls.length > 0 ? ' and each sibling' : ''}) reports MERGED via \`gh pr view <url> --json state\`. Already-merged PRs count as success.
@@ -689,7 +690,7 @@ If you hit a decision only the user can make, output a single line starting with
       let sessionId = merge.sessionId;
       let nextPrompt: string;
       if (r.status === 'awaiting_input') {
-        // Question already posted before the restart — just wait for the answer.
+        // Question already posted before the restart - just wait for the answer.
         const answer = await waitForAnswer(tb, cid);
         if (answer === null) return;
         nextPrompt = `The user answered: ${answer}\n\nContinue the merge. Same rules apply.`;
@@ -713,7 +714,7 @@ If you hit a decision only the user can make, output a single line starting with
         await tb.report(cid, { status: 'merging', sessionId });
         nextPrompt = `The user answered: ${answer}\n\nContinue the merge. Same rules apply.`;
       }
-      // Done means ALL merged — the root PR and every sibling PR.
+      // Done means ALL merged - the root PR and every sibling PR.
       const unmerged = [prUrl, ...siblingPrUrls].filter((u) => {
         try {
           return prState(dir, u) !== 'MERGED';
@@ -730,7 +731,7 @@ If you hit a decision only the user can make, output a single line starting with
           status: 'pr_ready',
           error: `Still unmerged: ${unmerged.join(', ')}. ${tail}`.slice(0, 500),
         });
-        console.log(`${tag} ✖ merge incomplete — still open: ${unmerged.join(', ')}`);
+        console.log(`${tag} ✖ merge incomplete - still open: ${unmerged.join(', ')}`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -748,7 +749,7 @@ If you hit a decision only the user can make, output a single line starting with
 
 /**
  * Done means MERGED: check this runner's pr_ready runs and report the
- * outcome — done on merge, failed when the PR was closed unmerged. The
+ * outcome - done on merge, failed when the PR was closed unmerged. The
  * backend reacts to the done transition by completing the thought.
  */
 async function checkOpenPRs(tb: TB): Promise<void> {
@@ -783,7 +784,7 @@ async function checkOpenPRs(tb: TB): Promise<void> {
         });
         if (openSiblings.length > 0) {
           console.log(
-            `  root PR merged but sibling PR(s) still open (${openSiblings.join(', ')}) — waiting`,
+            `  root PR merged but sibling PR(s) still open (${openSiblings.join(', ')}) - waiting`,
           );
           continue;
         }
@@ -817,20 +818,21 @@ function chatPrompt(chat: PendingChat, dir: string): string {
     .map((m) => m.text)
     .join('\n\n');
   if (chat.sessionId) {
-    return `The user says:\n\n${unanswered}\n\nReply as Bridget — concise, concrete, honest. Investigate in this checkout (git, gh) when the question needs it. Actions the repo's AGENTS.md sanctions for chat sessions may be EXECUTED when the user asks; verify outcomes with real commands and state plainly what you did versus did not do — never describe unexecuted steps as done.`;
+    return `The user says:\n\n${unanswered}\n\nReply as Bridget - concise, concrete, honest. Investigate in this checkout (git, gh) when the question needs it. Actions the repo's AGENTS.md sanctions for chat sessions may be EXECUTED when the user asks; verify outcomes with real commands and state plainly what you did versus did not do - never describe unexecuted steps as done.`;
   }
   const history = chat.messages
     .map((m) => `${m.role === 'user' ? 'User' : 'Bridget'}: ${m.text}`)
     .join('\n');
   return `You are Bridget, the ThoughtBridge agent for the project "${chat.projectName}". The user is chatting with you about this project from the ThoughtBridge app.
 
-Your working copy of the project's repo (${chat.repoFullName}) is at ${dir} — a chat-only checkout on the default branch. You may read anything (files, git history, \`gh\` for PRs/issues/CI) to answer properly. The project's captured thoughts live under ${chat.projectSlug}/thoughtbridge/ if present.
+Your working copy of the project's repo (${chat.repoFullName}) is at ${dir} - a chat-only checkout on the default branch. You may read anything (files, git history, \`gh\` for PRs/issues/CI) to answer properly. The project's captured thoughts live under ${chat.projectSlug}/thoughtbridge/ if present.
 
 RULES
-- FIRST read the repo's AGENTS.md and any .claude/skills/ — they define what a chat session may do here, including any actions explicitly SANCTIONED for chats (e.g. a release ritual). Follow them.
+- FIRST read the repo's AGENTS.md and any .claude/skills/ - they define what a chat session may do here, including any actions explicitly SANCTIONED for chats (e.g. a release ritual). Follow them.
 - Default is read-only: do not commit, push, or modify the repo EXCEPT actions the repo's AGENTS.md explicitly sanctions for chat sessions and the user explicitly asked for. For anything else that needs work, say what you'd do and suggest the user capture a thought and "bridge it".
-- BE HONEST ABOUT WHAT HAPPENED. Your reply must state plainly what you actually EXECUTED versus what you did NOT do. When you perform a sanctioned action, VERIFY the outcome with real commands (e.g. the tag exists on origin, the CI run started, the artifact uploaded) and report each result. If you couldn't or didn't do something, open your reply with that — never describe unexecuted steps in a way that reads as done.
+- BE HONEST ABOUT WHAT HAPPENED. Your reply must state plainly what you actually EXECUTED versus what you did NOT do. When you perform a sanctioned action, VERIFY the outcome with real commands (e.g. the tag exists on origin, the CI run started, the artifact uploaded) and report each result. If you couldn't or didn't do something, open your reply with that - never describe unexecuted steps in a way that reads as done.
 - Reply concise, concrete, honest. Plain text (light markdown fine). Your ENTIRE output is the chat reply.
+- Never use em dashes or en dashes in your replies. Use a comma, colon, or plain hyphen instead.
 
 CONVERSATION SO FAR
 ${history}
@@ -840,7 +842,7 @@ Reply to the user's latest message(s).`;
 
 async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void> {
   const tag = `[chat:${chat.projectSlug}]`;
-  console.log(`${tag} ${chat.pendingCount} message(s) — answering…`);
+  console.log(`${tag} ${chat.pendingCount} message(s) - answering…`);
   try {
     const dir = ensureCheckout(conf.workdir, chat.repoFullName, '__chat');
     let result: SessionResult;
@@ -850,11 +852,11 @@ async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void
       if (!chat.sessionId) throw err;
       // Sessions are per-directory: a repo/destination change strands the
       // stored id. Start fresh with the full preamble + history instead.
-      console.log(`${tag} stored session unusable — starting fresh`);
+      console.log(`${tag} stored session unusable - starting fresh`);
       const fresh: PendingChat = { ...chat, sessionId: null };
       result = await runClaude(dir, chatPrompt(fresh, dir), null, conf.model);
     }
-    const text = result.text.trim() || '(Bridget had nothing to say — try rephrasing.)';
+    const text = result.text.trim() || '(Bridget had nothing to say - try rephrasing.)';
     await tb.chatReply(chat.projectId, text, result.sessionId || null, chat.pendingCount);
     console.log(`${tag} ✔ replied (${text.length} chars)`);
   } catch (err) {
@@ -864,7 +866,7 @@ async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void
     try {
       await tb.chatReply(
         chat.projectId,
-        `Bridget hit an error answering this: ${message.slice(0, 300)} — send your message again to retry.`,
+        `Bridget hit an error answering this: ${message.slice(0, 300)} - send your message again to retry.`,
         chat.sessionId,
         chat.pendingCount,
       );
@@ -903,7 +905,7 @@ async function main(): Promise<void> {
 
   const pool = new SessionPool(conf.maxSessions);
 
-  // Chat lane: its own faster poll (10s) so conversations feel responsive —
+  // Chat lane: its own faster poll (10s) so conversations feel responsive -
   // fully independent of the build queue and TB_MAX_SESSIONS.
   if (!once) {
     void (async () => {
@@ -922,14 +924,14 @@ async function main(): Promise<void> {
   try {
     const { runs: mine } = await tb.mine();
     for (const r of mine) {
-      // pr_ready runs are DONE building — the merge-watcher owns them from
+      // pr_ready runs are DONE building - the merge-watcher owns them from
       // here. Re-executing one re-pushes a branch that may already be merged
       // and deleted, clobbering a successful run with 'failed'. Likewise
       // merge_requested/merging belong to sweepMergeRequests in the main loop.
       if (r.status === 'pr_ready' || r.status === 'merge_requested' || r.status === 'merging')
         continue;
       if (r.status === 'awaiting_input') {
-        // A question WITH a PR attached is a merge-flow question — the
+        // A question WITH a PR attached is a merge-flow question - the
         // merge sweep owns it. Build questions (no PR yet) resume here.
         const capture = await tb.capture(r.captureId).catch(() => null);
         const prUrl = (capture?.['executeRun'] as { prUrl?: string | null } | null)?.prUrl;
@@ -947,7 +949,7 @@ async function main(): Promise<void> {
     try {
       await sweepMergeRequests(conf, tb, pool);
       await checkOpenPRs(tb);
-      // One session per repo, up to maxSessions across repos — oldest first.
+      // One session per repo, up to maxSessions across repos - oldest first.
       // A run that can't start this tick (repo busy / pool full) just stays
       // queued and is retried next poll.
       const { runs } = await tb.queue();

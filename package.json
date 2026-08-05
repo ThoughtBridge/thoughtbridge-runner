@@ -1,7 +1,7 @@
 {
   "name": "thoughtbridge-runner",
   "version": "0.1.0",
-  "description": "Self-hosted bridge-it runner — turns ThoughtBridge thoughts into pull requests with Claude Code",
+  "description": "Self-hosted bridge-it runner - turns ThoughtBridge thoughts into pull requests with Claude Code",
   "type": "module",
   "bin": {
     "thoughtbridge-runner": "src/index.ts"
