@@ -7,7 +7,8 @@
  * the thought on a branch, and opens a PR. Questions from the agent pause the
  * run and surface in the ThoughtBridge app; your answer resumes the session.
  *
- * Requirements on this machine: git, gh (authenticated), claude (Claude Code).
+ * Requirements on this machine: git, gh (authenticated), and whichever agent
+ * CLI is selected (claude / codex / gemini - see TB_AGENT below), authenticated.
  *
  * Config (env or ~/.thoughtbridge-runner.json):
  *   TB_API_URL        - default https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1
@@ -17,30 +18,38 @@
  *                       the app lists instances and can pin a project's
  *                       bridge-it work to one of them.
  *   TB_WORKDIR        - where repos are cloned (default ~/.thoughtbridge-runner/work)
+ *   TB_AGENT          - which coding-agent CLI drives sessions: "claude"
+ *                       (default), "codex", or "gemini". See src/agents.ts.
+ *                       Codex and claude can natively resume a session;
+ *                       gemini can't, so the runner replays conversation
+ *                       history from a local file instead (see spawnTurn()).
+ *                       gemini also needs GOOGLE_CLOUD_PROJECT set in this
+ *                       process's environment (a GCP project with the Cloud
+ *                       AI Companion API enabled) when its account requires
+ *                       one - the gemini CLI itself reports this.
  *   TB_AGENT_COMMAND  - optional skill/slash-command prefix (e.g. "/bee-feature").
  *                       Absent → plain prompt (the default for everyone).
- *   TB_MODEL          - model for every Claude session the runner drives.
- *                       An alias ("sonnet", "opus", "fable", "haiku") or a full
- *                       model name ("claude-sonnet-5"), passed to claude as
- *                       --model. Absent → the claude CLI's own default (whatever
- *                       this machine's Claude Code config selects).
+ *   TB_MODEL          - model for every agent session the runner drives.
+ *                       For claude: an alias ("sonnet", "opus", "fable",
+ *                       "haiku") or a full model name, passed as --model.
+ *                       For codex/gemini: passed as -m. Absent → each CLI's
+ *                       own configured default.
  *   TB_POLL_SECONDS   - queue poll interval (default 60)
- *   TB_MAX_SESSIONS   - max concurrent Claude sessions (default 3; always
+ *   TB_MAX_SESSIONS   - max concurrent agent sessions (default 3; always
  *                       at most ONE session per repo checkout)
  *
- * The Claude Code SESSION stays on this machine; the run record in
- * ThoughtBridge carries (machine, sessionId) so `claude --resume <sessionId>`
- * here drops you into the live conversation.
+ * The agent SESSION stays on this machine; the run record in ThoughtBridge
+ * carries (machine, sessionId) so the adapter's resume command (e.g.
+ * `claude --resume <sessionId>`, `codex resume <sessionId>`) here drops
+ * you into the live conversation - when the agent supports resuming one.
  */
 
-import { execFileSync, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-
-const execFileAsync = promisify(execFile);
+import { pickAdapter, type AgentAdapter, type SessionResult } from './agents.js';
 
 // ── config ──────────────────────────────────────────────────────────────────
 
@@ -50,10 +59,12 @@ interface Config {
   runnerId: string;
   workdir: string;
   agentCommand: string | null;
-  /** Model passed to claude as --model; null → the CLI's configured default. */
+  /** Model passed to the agent CLI (--model / -m); null → its own default. */
   model: string | null;
+  /** Which agent CLI drives sessions - see TB_AGENT in the header comment. */
+  agent: AgentAdapter;
   pollSeconds: number;
-  /** Max concurrent Claude sessions (builds + merges) across all repos. */
+  /** Max concurrent agent sessions (builds + merges) across all repos. */
   maxSessions: number;
 }
 
@@ -83,6 +94,7 @@ function loadConfig(): Config {
     workdir: get('TB_WORKDIR') ?? join(homedir(), '.thoughtbridge-runner', 'work'),
     agentCommand: get('TB_AGENT_COMMAND') ?? null,
     model: get('TB_MODEL') ?? null,
+    agent: pickAdapter(get('TB_AGENT')),
     pollSeconds: Number(get('TB_POLL_SECONDS') ?? 60),
     maxSessions: Math.max(1, Number(get('TB_MAX_SESSIONS') ?? 3)),
   };
@@ -248,24 +260,10 @@ interface PendingChat {
   pendingCount: number;
 }
 
-// ── git / claude helpers ────────────────────────────────────────────────────
+// ── git helpers ──────────────────────────────────────────────────────────────
 
 function sh(cwd: string, cmd: string, args: string[]): string {
   return execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-}
-
-async function shAsync(
-  cwd: string,
-  cmd: string,
-  args: string[],
-  timeoutMs: number,
-): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(cmd, args, {
-    cwd,
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-  });
 }
 
 function ensureCheckout(workdir: string, repoFullName: string, suffix = ''): string {
@@ -286,33 +284,99 @@ function ensureCheckout(workdir: string, repoFullName: string, suffix = ''): str
 /** The QUESTION marker contract for headless runs (v0). */
 const QUESTION_RE = /^QUESTION:\s*(.+)$/m;
 
-interface SessionResult {
-  sessionId: string;
+// ── replay fallback for agents that can't natively resume a session ────────
+//
+// Codex and claude carry a real session id across turns (`--resume <id>`).
+// Gemini's --resume only understands "latest" or a per-directory index, not
+// a stable id, so canResume is false for it. For those adapters we keep a
+// small per-run transcript in the checkout and replay it into a fresh spawn
+// on every turn instead of resuming. The chat lane doesn't need this - its
+// server-side message history already gives a fresh session everything it
+// needs (see answerChat).
+
+interface HistoryEntry {
+  role: 'prompt' | 'reply';
   text: string;
 }
 
-async function runClaude(
-  cwd: string,
-  prompt: string,
-  resumeSessionId: string | null,
-  model: string | null,
+function historyFileName(captureId: string): string {
+  return `.tb-run-history-${captureId}.jsonl`;
+}
+
+/** Keeps the history file out of the checkout's git status without ever
+ *  touching anything that gets committed (.git/info/exclude, not .gitignore). */
+function excludeFromGit(dir: string, fileName: string): void {
+  try {
+    const excludePath = join(dir, '.git', 'info', 'exclude');
+    const existing = existsSync(excludePath) ? readFileSync(excludePath, 'utf8') : '';
+    if (existing.split('\n').includes(fileName)) return;
+    const sep = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+    appendFileSync(excludePath, `${sep}${fileName}\n`);
+  } catch {
+    /* best effort - never block a run over a housekeeping file */
+  }
+}
+
+function appendHistory(dir: string, captureId: string, role: HistoryEntry['role'], text: string): void {
+  const fileName = historyFileName(captureId);
+  excludeFromGit(dir, fileName);
+  appendFileSync(join(dir, fileName), `${JSON.stringify({ role, text })}\n`);
+}
+
+function readHistory(dir: string, captureId: string): HistoryEntry[] {
+  const path = join(dir, historyFileName(captureId));
+  if (!existsSync(path)) return [];
+  return readFileSync(path, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as HistoryEntry);
+}
+
+function buildReplayPrompt(contextHeader: string, history: HistoryEntry[], message: string): string {
+  const transcript = history
+    .map((h) => (h.role === 'prompt' ? `--- you were asked ---\n${h.text}` : `--- you replied ---\n${h.text}`))
+    .join('\n\n');
+  return `${contextHeader}
+
+This agent CLI has no native session resume, so this is a FRESH process
+being given the full conversation so far. Do not repeat completed work -
+pick up exactly where the last reply left off.
+
+CONVERSATION SO FAR
+${transcript}
+
+${message}`;
+}
+
+/**
+ * Spawns one agent turn. When the active adapter can resume (claude, codex),
+ * this is a thin pass-through to adapter.spawn - byte-identical to calling
+ * it directly. When it can't (gemini), turns after the first are replayed
+ * from a local history file instead of a native resume, and every turn is
+ * recorded to that file for the next one. `contextHeader` is the run's
+ * original full prompt/instructions (used only to prime a replay);
+ * `message` is this turn's actual prompt (the context header itself, on the
+ * very first turn).
+ */
+async function spawnTurn(
+  conf: Config,
+  dir: string,
+  captureId: string,
+  contextHeader: string,
+  sessionId: string | null,
+  message: string,
 ): Promise<SessionResult> {
-  // Autonomous by definition: the session runs headless in the runner's own
-  // checkout, so nobody is present to approve tool calls. Without this flag
-  // every Edit/Write/git command is denied and the run stalls.
-  const args = [
-    '-p', prompt,
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-  ];
-  if (model) args.push('--model', model);
-  if (resumeSessionId) args.unshift('--resume', resumeSessionId);
-  const { stdout } = await shAsync(cwd, 'claude', args, 45 * 60_000);
-  const parsed = JSON.parse(stdout) as { session_id?: string; result?: string };
-  return {
-    sessionId: parsed.session_id ?? resumeSessionId ?? '',
-    text: parsed.result ?? '',
-  };
+  if (conf.agent.canResume) {
+    return conf.agent.spawn(dir, message, sessionId, conf.model);
+  }
+  const isFirstTurn = sessionId === null;
+  const prompt = isFirstTurn ? message : buildReplayPrompt(contextHeader, readHistory(dir, captureId), message);
+  const result = await conf.agent.spawn(dir, prompt, null, conf.model);
+  appendHistory(dir, captureId, 'prompt', message);
+  appendHistory(dir, captureId, 'reply', result.text);
+  // No real session id to hand back - synthesize a stable, truthy one scoped
+  // to this capture so callers' "have we started yet?" checks keep working.
+  return { sessionId: `replay:${captureId}`, text: result.text };
 }
 
 // ── the run ─────────────────────────────────────────────────────────────────
@@ -352,7 +416,7 @@ RULES
 function buildPrBody(
   summary: string,
   cid: string,
-  sessionId: string | null,
+  resumeCommand: string,
   executeInstruction: string | null,
 ): string {
   const footer = [
@@ -360,7 +424,7 @@ function buildPrBody(
     'Built from a ThoughtBridge "bridge it" capture.',
     '',
     `CaptureId: ${cid}`,
-    `Session: \`claude --resume ${sessionId}\` on \`${hostname()}\``,
+    `Session: \`${resumeCommand}\` on \`${hostname()}\``,
   ].join('\n');
   const body = summary.trim() || (executeInstruction ?? '').trim();
   const budget = 65_000 - footer.length;
@@ -402,10 +466,14 @@ async function executeRun(
       (capture['transcript'] as string | undefined) ??
       '(no transcript available)';
 
+    // The run's original instructions - used verbatim as the first turn's
+    // prompt, and as the header a replay fallback (see spawnTurn) primes
+    // every later turn with.
+    const contextHeader = buildPrompt(conf, run, markdown, branch);
     let sessionId: string | null = recover ? run.sessionId : null;
     let prompt = recover && sessionId
       ? 'The runner restarted. Continue the work order from where you left off - if it is already complete, summarise what was done. Same rules apply.'
-      : buildPrompt(conf, run, markdown, branch);
+      : contextHeader;
     if (recover && run.status === 'awaiting_input') {
       // Re-enter the wait: the question is still open in the app.
       const answer = await waitForAnswer(tb, cid);
@@ -425,7 +493,7 @@ async function executeRun(
         ...(sessionId ? {} : { branch }),
         ...(sessionId ? { sessionId } : {}),
       });
-      const result = await runClaude(dir, prompt, sessionId, conf.model);
+      const result = await spawnTurn(conf, dir, cid, contextHeader, sessionId, prompt);
       finalSummary = result.text;
       sessionId = result.sessionId;
       await tb.report(cid, { status: 'building', sessionId, branch });
@@ -487,7 +555,7 @@ async function executeRun(
         sessionId,
         error:
           `Session produced no commits - nothing to open a PR for. ` +
-          `Bridget's last words: "${summaryTail}" - resume with: cd ${dir} && claude --resume ${sessionId}`,
+          `Bridget's last words: "${summaryTail}" - resume with: ${conf.agent.resumeCommand(dir, sessionId ?? '')}`,
       });
       console.log(`${tag} no commits - reported done (empty)`);
       return;
@@ -499,7 +567,7 @@ async function executeRun(
       '--head', branch,
       '--title', `Thought: ${run.title ?? cid}`,
       '--body',
-      buildPrBody(finalSummary, cid, sessionId, run.executeInstruction),
+      buildPrBody(finalSummary, cid, conf.agent.resumeCommand(dir, sessionId ?? ''), run.executeInstruction),
     ]).trim();
 
     // Sibling PRs the session opened (multi-repo bridge-it) ride the run
@@ -700,7 +768,7 @@ If you hit a decision only the user can make, output a single line starting with
       await tb.report(cid, { status: 'merging', ...(sessionId ? { sessionId } : {}) });
       let result: SessionResult;
       for (;;) {
-        result = await runClaude(dir, nextPrompt, sessionId, conf.model);
+        result = await spawnTurn(conf, dir, cid, prompt, sessionId, nextPrompt);
         sessionId = result.sessionId;
         const q = QUESTION_RE.exec(result.text);
         if (!q) break;
@@ -847,14 +915,19 @@ async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void
     const dir = ensureCheckout(conf.workdir, chat.repoFullName, '__chat');
     let result: SessionResult;
     try {
-      result = await runClaude(dir, chatPrompt(chat, dir), chat.sessionId, conf.model);
+      // Adapters that can't resume (e.g. gemini) always report sessionId ''
+      // from a chat spawn, which chatReply below stores as null - so
+      // chat.sessionId is already falsy here on every turn for them, and
+      // chatPrompt naturally takes its "no session, full history" branch.
+      // No separate history file needed - chat.messages IS that history.
+      result = await conf.agent.spawn(dir, chatPrompt(chat, dir), chat.sessionId, conf.model);
     } catch (err) {
       if (!chat.sessionId) throw err;
       // Sessions are per-directory: a repo/destination change strands the
       // stored id. Start fresh with the full preamble + history instead.
       console.log(`${tag} stored session unusable - starting fresh`);
       const fresh: PendingChat = { ...chat, sessionId: null };
-      result = await runClaude(dir, chatPrompt(fresh, dir), null, conf.model);
+      result = await conf.agent.spawn(dir, chatPrompt(fresh, dir), null, conf.model);
     }
     const text = result.text.trim() || '(Bridget had nothing to say - try rephrasing.)';
     await tb.chatReply(chat.projectId, text, result.sessionId || null, chat.pendingCount);
@@ -894,9 +967,9 @@ async function main(): Promise<void> {
   const once = process.argv.includes('--once');
 
   console.log(
-    `thoughtbridge-runner ${conf.runnerId} on ${hostname()}` +
+    `thoughtbridge-runner ${conf.runnerId} on ${hostname()} (agent: ${conf.agent.name})` +
       (conf.agentCommand ? ` (agent command: ${conf.agentCommand})` : ' (plain prompt)') +
-      ` (model: ${conf.model ?? 'claude default'})`,
+      ` (model: ${conf.model ?? `${conf.agent.name} default`})`,
   );
 
   // Announce this instance to the account's runner registry (multi-instance:
