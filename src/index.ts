@@ -171,6 +171,21 @@ function loadConfig(): Config[] {
       console.error(`warning: could not parse ${legacyJsonPath} - ignoring`);
     }
   }
+  // .env next to package.json: the standard place for TB_API_KEY so plain
+  // `npm start` (or the downloaded binary run from this directory) works.
+  // Precedence: real env vars > .env > legacy ~/.thoughtbridge-runner.json.
+  const dotenvPath = join(process.cwd(), '.env');
+  if (existsSync(dotenvPath)) {
+    for (const line of readFileSync(dotenvPath, 'utf8').split('\n')) {
+      const m = /^\s*(?:export\s+)?([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+      if (!m || m[1].startsWith('#')) continue;
+      let v = m[2];
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+        v = v.slice(1, -1);
+      }
+      fileConf[m[1]] = v;
+    }
+  }
   const get = (key: string): string | undefined => process.env[key] ?? fileConf[key];
 
   const apiUrl =
@@ -184,7 +199,13 @@ function loadConfig(): Config[] {
   if (!confPath) {
     const apiKey = get('TB_API_KEY');
     if (!apiKey) {
-      console.error('TB_API_KEY is required (a runner-scoped ThoughtBridge API key).');
+      console.error(
+        'TB_API_KEY is required (a runner-scoped ThoughtBridge API key, created in the app under Settings > API keys).\n' +
+          'Provide it one of three ways:\n' +
+          '  1. a .env file in this directory containing:  TB_API_KEY=tbk_...\n' +
+          '  2. inline:  TB_API_KEY=tbk_... npm start\n' +
+          '  3. "apiKey:" in a runner.yaml (see README for the profile format)',
+      );
       process.exit(1);
     }
     return [
@@ -219,7 +240,7 @@ function loadConfig(): Config[] {
   const apiKey = process.env['TB_API_KEY'] ?? (typeof yamlFile.apiKey === 'string' ? yamlFile.apiKey : undefined);
   if (!apiKey) {
     console.error(
-      `TB_API_KEY is required - set the TB_API_KEY env var, or "apiKey:" in ${confPath}.`,
+      `TB_API_KEY is required - set "apiKey:" in ${confPath}, add TB_API_KEY=tbk_... to a .env file in this directory, or set the TB_API_KEY env var.`,
     );
     process.exit(1);
   }

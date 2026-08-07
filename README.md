@@ -49,8 +49,9 @@ Grab the binary for your platform from the
 
 ```bash
 chmod +x thoughtbridge-runner-macos-arm64
-TB_API_KEY=tbk_… ./thoughtbridge-runner-macos-arm64          # poll loop (60s)
-TB_API_KEY=tbk_… ./thoughtbridge-runner-macos-arm64 --once   # single pass - good for testing
+echo 'TB_API_KEY=tbk_…' > .env          # one-time setup; or pass it inline as below
+./thoughtbridge-runner-macos-arm64          # poll loop (60s)
+./thoughtbridge-runner-macos-arm64 --once   # single pass - good for testing
 ```
 
 ### Option B: clone + npm
@@ -59,8 +60,9 @@ TB_API_KEY=tbk_… ./thoughtbridge-runner-macos-arm64 --once   # single pass - g
 git clone https://github.com/ThoughtBridge/thoughtbridge-runner.git
 cd thoughtbridge-runner
 npm install
-TB_API_KEY=tbk_… npm start          # poll loop (60s)
-TB_API_KEY=tbk_… npm run once       # single pass - good for testing
+cp .env.example .env                # then put your real key in .env (one-time)
+npm start                           # poll loop (60s)
+npm run once                        # single pass - good for testing
 ```
 
 Both options run the exact same code; the binary just skips the Node/tsx
