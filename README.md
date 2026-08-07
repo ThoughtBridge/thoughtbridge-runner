@@ -13,21 +13,100 @@ Your code and the full agent conversation never leave your machine -
 ThoughtBridge only sees the run's status, branch, PR link, and any questions
 the runner reports.
 
-## Requirements
+## Prerequisites
 
-- Node 20+, `git`, [`gh`](https://cli.github.com) (authenticated), and
-  whichever agent CLI you select (`claude`, `codex`, or `gemini`),
-  authenticated, on the machine
-- A ThoughtBridge API key with the **runner** scope (app → Settings → API keys)
-- v1 works with **GitHub destinations** (a PR is the review mechanism)
+Before you start the runner, make sure you have:
 
-## Run it
+- **[`git`](https://git-scm.com/downloads)** on your PATH.
+- **[`gh`](https://cli.github.com)** (the GitHub CLI) on your PATH, authenticated:
+  `gh auth login`.
+- **At least one coding-agent CLI**, installed and authenticated:
+  - **Claude Code** (default): `npm install -g @anthropic-ai/claude-code`,
+    then run `claude` once and follow the login prompt.
+  - **Codex**: `npm install -g @openai/codex`, then run `codex login`.
+  - **Gemini CLI**: `npm install -g @google/gemini-cli`, then run `gemini`
+    once and follow the first-run login prompt. Some Google accounts also
+    need `GOOGLE_CLOUD_PROJECT` set - see the reference table below.
+- A ThoughtBridge API key with the **runner** scope (app → Settings → API keys).
+
+You don't need all three agent CLIs - just the ones your profiles use (see
+below). The runner checks all of this itself at startup (see *Preflight*).
+
+v1 works with **GitHub destinations** (a PR is the review mechanism).
+
+## Quickstart
+
+### Option A: downloaded binary
+
+Grab the binary for your platform from the
+[latest release](https://github.com/ThoughtBridge/thoughtbridge-runner/releases/latest):
+
+| Platform | Asset |
+|---|---|
+| macOS (Apple Silicon) | `thoughtbridge-runner-macos-arm64` |
+| macOS (Intel) | `thoughtbridge-runner-macos-x64` |
+| Linux (x64) | `thoughtbridge-runner-linux-x64` |
 
 ```bash
+chmod +x thoughtbridge-runner-macos-arm64
+TB_API_KEY=tbk_… ./thoughtbridge-runner-macos-arm64          # poll loop (60s)
+TB_API_KEY=tbk_… ./thoughtbridge-runner-macos-arm64 --once   # single pass - good for testing
+```
+
+### Option B: clone + npm
+
+```bash
+git clone https://github.com/ThoughtBridge/thoughtbridge-runner.git
+cd thoughtbridge-runner
 npm install
 TB_API_KEY=tbk_… npm start          # poll loop (60s)
 TB_API_KEY=tbk_… npm run once       # single pass - good for testing
 ```
+
+Both options run the exact same code; the binary just skips the Node/tsx
+install step.
+
+## Runner profiles - one process, N runners
+
+By default (no config file) the runner is a single profile built from the
+env vars below - unchanged from earlier versions.
+
+To drive **several agent identities from one process** - e.g. a Codex
+profile and a Gemini profile polling and building side by side - add a
+`runner.yaml` next to where you run the binary (or point `--config <path>` /
+`TB_CONFIG` at one):
+
+```yaml
+apiKey: tbk_...        # optional; TB_API_KEY env still wins if set
+profiles:
+  - id: runner-codex
+    agent: codex        # claude | codex | gemini (default claude)
+    model: gpt-5-codex   # optional; agent CLI's own default when omitted
+  - id: runner-gemini-flash
+    agent: gemini
+    model: gemini-2.5-flash
+```
+
+Each profile:
+
+- registers, polls, claims, and merge-sweeps under its **own id** (shown in
+  the ThoughtBridge app's runner registry, so you can pin a project to one
+  specific profile).
+- gets its **own namespaced subdirectory** under `TB_WORKDIR` - two profiles
+  never share a working copy of the same repo, even if they're both assigned
+  the same project.
+- has its poll loop **staggered a little** at startup so several profiles
+  don't hit the API in lockstep.
+
+Every other setting (`TB_API_URL`, `TB_WORKDIR`, `TB_AGENT_COMMAND`,
+`TB_POLL_SECONDS`, `TB_MAX_SESSIONS`) is shared across all profiles in the
+file. `TB_API_KEY`, when set, overrides `apiKey:` in the file for every
+profile.
+
+Bad config (unknown `agent:` value, a profile missing `id`, or two profiles
+sharing an `id`) fails fast at startup with the exact problem named.
+
+## Env-var single-profile mode (no config file)
 
 Config via env or `~/.thoughtbridge-runner.json`:
 
@@ -37,10 +116,38 @@ Config via env or `~/.thoughtbridge-runner.json`:
 | `TB_API_URL` | production API | override for self-hosted backends |
 | `TB_RUNNER_ID` | `runner-<hostname>` | stable id shown on the run |
 | `TB_WORKDIR` | `~/.thoughtbridge-runner/work` | where repos are cloned |
-| `TB_AGENT` | `claude` | which coding-agent CLI drives sessions: `claude`, `codex`, or `gemini`. See `src/agents.ts`. Codex and claude can resume a session natively; gemini can't, so the runner replays conversation history from a local file instead. Gemini also needs `GOOGLE_CLOUD_PROJECT` set in this process's environment when its account requires one (a GCP project with the Cloud AI Companion API enabled) - the `gemini` CLI itself reports this if it's missing. |
+| `TB_AGENT` | `claude` | which coding-agent CLI drives sessions: `claude`, `codex`, or `gemini`. See `src/agents.ts`. |
 | `TB_AGENT_COMMAND` | *(none - plain prompt)* | your own skill/slash command, e.g. `/my-orchestrator`. The runner invokes it with the thought and steps back. |
-| `TB_MODEL` | *(none - the agent's default)* | model for every session the runner drives, passed as `--model` (claude) or `-m` (codex, gemini). For claude, an alias (`sonnet`, `opus`, `fable`, `haiku`) or a full model name (`claude-sonnet-5`). Unset, sessions use whatever the CLI's own config selects - the runner logs the effective agent and model at startup. |
+| `TB_MODEL` | *(none - the agent's default)* | model for every session the runner drives, passed as `--model` (claude) or `-m` (codex, gemini). |
 | `TB_POLL_SECONDS` | `60` | queue poll interval |
+| `TB_MAX_SESSIONS` | `3` | max concurrent agent sessions per profile (always at most ONE session per repo checkout) |
+| `TB_CONFIG` | *(none)* | path to a `runner.yaml` - same as `--config <path>`. Presence of `./runner.yaml` (cwd) also triggers config-file mode without setting this. |
+| `GOOGLE_CLOUD_PROJECT` | *(none)* | needed by the `gemini` agent CLI on Google accounts that require a GCP project for API access - the `gemini` CLI itself reports this if it's missing. |
+
+Codex and Claude can natively resume a session; Gemini can't, so the runner
+replays conversation history from a local file instead (see `spawnTurn()` in
+`src/index.ts`).
+
+## Preflight
+
+On every startup, before serving any work, the runner runs a fast checklist
+(presence + status checks only - it never spawns a real agent turn):
+
+- `git` on PATH.
+- `gh` on PATH **and** authenticated (`gh auth status`).
+- For each configured profile's agent CLI: installed, and authenticated
+  where the CLI supports a cheap, read-only status check (`codex login
+  status`; a probed `auth status`/`whoami`-style subcommand for `claude` and
+  `gemini`; a file-based fallback for `gemini` when no such subcommand
+  exists).
+
+Every failed check prints the exact remedy (install command, auth command).
+
+- **`git` or `gh` missing/unauthenticated** → the runner exits nonzero.
+  Nothing works without them.
+- **A profile's agent CLI missing/unauthenticated** → that profile is
+  skipped with a loud warning; every other healthy profile still starts.
+  The runner only exits nonzero when **no** profile is healthy.
 
 ## How a run works
 
@@ -61,5 +168,28 @@ supports resuming one.
 
 - Never commits to the default branch - branch + PR only (enforced by the
   runner, not just the prompt).
-- One run at a time; every run is cancellable from the app.
+- One run at a time per repo checkout; every run is cancellable from the app.
 - The API key can be revoked in the app at any moment.
+
+## Platform support
+
+- **macOS** (Apple Silicon and Intel) and **Linux (x64)**: fully supported,
+  including downloadable release binaries.
+- **Windows**: deferred. The runner's TypeScript itself is cross-platform,
+  but `bootstrap.sh` and this project's release pipeline are bash/Unix-only
+  today - a Windows release needs a bash port of `bootstrap.sh` (or a
+  PowerShell equivalent) plus a `bun-windows-x64` build target added to
+  `.github/workflows/release.yml`. Until then, Windows users can run via
+  WSL using the "clone + npm" quickstart above.
+
+## Development
+
+```bash
+npm install
+npm run typecheck   # tsc --noEmit
+npm run once         # single pass against the real API
+```
+
+Release binaries are built by `.github/workflows/release.yml` on any `v*`
+tag push, using [Bun](https://bun.sh)'s `--compile` cross-compilation (one
+Linux runner builds all three binaries - no macOS runner needed).

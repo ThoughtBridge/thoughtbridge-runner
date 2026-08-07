@@ -9,8 +9,16 @@
  *
  * Requirements on this machine: git, gh (authenticated), and whichever agent
  * CLI is selected (claude / codex / gemini - see TB_AGENT below), authenticated.
+ * Checked at startup - see src/preflight.ts.
  *
- * Config (env or ~/.thoughtbridge-runner.json):
+ * Runner profiles: one process can drive several independent runner
+ * identities ("profiles"), each with its own agent CLI/model, polling and
+ * claiming work under its own runnerId, in its own namespaced workdir. See
+ * `runner.yaml` (or --config <path> / TB_CONFIG) below. With no config file,
+ * behavior is unchanged from before profiles existed: exactly one profile
+ * built from the env vars in this comment.
+ *
+ * Config (env or ~/.thoughtbridge-runner.json) - single-profile mode:
  *   TB_API_URL        - default https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1
  *   TB_API_KEY        - a `runner`-scoped ThoughtBridge API key (required)
  *   TB_RUNNER_ID      - stable id for this runner (default: runner-<hostname>).
@@ -36,7 +44,23 @@
  *                       own configured default.
  *   TB_POLL_SECONDS   - queue poll interval (default 60)
  *   TB_MAX_SESSIONS   - max concurrent agent sessions (default 3; always
- *                       at most ONE session per repo checkout)
+ *                       at most ONE session per repo checkout) - applies to
+ *                       EACH profile's own pool.
+ *
+ * Multi-profile mode - runner.yaml (cwd, or --config <path> / TB_CONFIG):
+ *   apiKey: tbk_...        # optional; TB_API_KEY env still wins if set
+ *   profiles:
+ *     - id: runner-codex
+ *       agent: codex        # claude | codex | gemini (default claude)
+ *       model: gpt-5-codex  # optional; agent CLI's own default when omitted
+ *     - id: runner-gemini-flash
+ *       agent: gemini
+ *       model: gemini-2.5-flash
+ * Every other setting above (TB_API_URL, TB_WORKDIR, TB_AGENT_COMMAND,
+ * TB_POLL_SECONDS, TB_MAX_SESSIONS) still applies, shared across all
+ * profiles. Each profile registers, polls, claims, and merge-sweeps under
+ * its own id, and gets its own namespaced subdirectory under TB_WORKDIR so
+ * two profiles never share a working copy of the same repo.
  *
  * The agent SESSION stays on this machine; the run record in ThoughtBridge
  * carries (machine, sessionId) so the adapter's resume command (e.g.
@@ -49,11 +73,13 @@ import { hostname } from 'node:os';
 import { mkdirSync, existsSync, readFileSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { pickAdapter, type AgentAdapter, type SessionResult } from './agents.js';
+import { runPreflight } from './preflight.js';
 
 // ── config ──────────────────────────────────────────────────────────────────
 
-interface Config {
+export interface Config {
   apiUrl: string;
   apiKey: string;
   runnerId: string;
@@ -68,36 +94,149 @@ interface Config {
   maxSessions: number;
 }
 
-function loadConfig(): Config {
+const KNOWN_AGENTS = ['claude', 'codex', 'gemini'] as const;
+
+interface RunnerYamlProfile {
+  id?: unknown;
+  agent?: unknown;
+  model?: unknown;
+}
+
+interface RunnerYamlFile {
+  apiKey?: unknown;
+  profiles?: unknown;
+}
+
+/** --config <path> flag, else TB_CONFIG env, else ./runner.yaml if present. */
+function resolveConfigPath(): string | null {
+  const args = process.argv.slice(2);
+  const flagIdx = args.indexOf('--config');
+  if (flagIdx !== -1 && args[flagIdx + 1]) return args[flagIdx + 1]!;
+  const envPath = process.env['TB_CONFIG'];
+  if (envPath) return envPath;
+  const def = join(process.cwd(), 'runner.yaml');
+  return existsSync(def) ? def : null;
+}
+
+/** Fails fast with a clear message on any malformed profile - unknown agent
+ *  name, missing/blank id, or duplicate ids. */
+function validateAndNormalizeProfiles(raw: unknown, confPath: string): RunnerYamlProfile[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    console.error(`${confPath}: "profiles" must be a non-empty array.`);
+    process.exit(1);
+  }
+  const seenIds = new Set<string>();
+  for (const [i, entry] of raw.entries()) {
+    if (typeof entry !== 'object' || entry === null) {
+      console.error(`${confPath}: profiles[${i}] must be an object.`);
+      process.exit(1);
+    }
+    const p = entry as RunnerYamlProfile;
+    if (typeof p.id !== 'string' || p.id.trim().length === 0) {
+      console.error(`${confPath}: profiles[${i}] is missing a non-empty "id".`);
+      process.exit(1);
+    }
+    if (seenIds.has(p.id)) {
+      console.error(`${confPath}: duplicate profile id "${p.id}" - ids must be unique.`);
+      process.exit(1);
+    }
+    seenIds.add(p.id);
+    if (p.agent !== undefined && !KNOWN_AGENTS.includes(p.agent as (typeof KNOWN_AGENTS)[number])) {
+      console.error(
+        `${confPath}: profile "${p.id}" has unknown agent "${String(p.agent)}" - must be one of: ${KNOWN_AGENTS.join(', ')}.`,
+      );
+      process.exit(1);
+    }
+    if (p.model !== undefined && typeof p.model !== 'string') {
+      console.error(`${confPath}: profile "${p.id}" has a non-string "model".`);
+      process.exit(1);
+    }
+  }
+  return raw as RunnerYamlProfile[];
+}
+
+/**
+ * Builds one Config per profile. With no runner.yaml (and no --config /
+ * TB_CONFIG), this is exactly today's behavior: a single profile from
+ * TB_RUNNER_ID/TB_AGENT/TB_MODEL, workdir unchanged (no per-profile
+ * subdirectory) - so existing single-runner setups keep working unchanged.
+ */
+function loadConfig(): Config[] {
   let fileConf: Record<string, string> = {};
-  const confPath = join(homedir(), '.thoughtbridge-runner.json');
-  if (existsSync(confPath)) {
+  const legacyJsonPath = join(homedir(), '.thoughtbridge-runner.json');
+  if (existsSync(legacyJsonPath)) {
     try {
-      fileConf = JSON.parse(readFileSync(confPath, 'utf8')) as Record<string, string>;
+      fileConf = JSON.parse(readFileSync(legacyJsonPath, 'utf8')) as Record<string, string>;
     } catch {
-      console.error(`warning: could not parse ${confPath} - ignoring`);
+      console.error(`warning: could not parse ${legacyJsonPath} - ignoring`);
     }
   }
   const get = (key: string): string | undefined => process.env[key] ?? fileConf[key];
 
-  const apiKey = get('TB_API_KEY');
-  if (!apiKey) {
-    console.error('TB_API_KEY is required (a runner-scoped ThoughtBridge API key).');
+  const apiUrl =
+    get('TB_API_URL') ?? 'https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1';
+  const workdirBase = get('TB_WORKDIR') ?? join(homedir(), '.thoughtbridge-runner', 'work');
+  const agentCommand = get('TB_AGENT_COMMAND') ?? null;
+  const pollSeconds = Number(get('TB_POLL_SECONDS') ?? 60);
+  const maxSessions = Math.max(1, Number(get('TB_MAX_SESSIONS') ?? 3));
+
+  const confPath = resolveConfigPath();
+  if (!confPath) {
+    const apiKey = get('TB_API_KEY');
+    if (!apiKey) {
+      console.error('TB_API_KEY is required (a runner-scoped ThoughtBridge API key).');
+      process.exit(1);
+    }
+    return [
+      {
+        apiUrl,
+        apiKey,
+        runnerId: get('TB_RUNNER_ID') ?? `runner-${hostname()}`,
+        workdir: workdirBase,
+        agentCommand,
+        model: get('TB_MODEL') ?? null,
+        agent: pickAdapter(get('TB_AGENT')),
+        pollSeconds,
+        maxSessions,
+      },
+    ];
+  }
+
+  let doc: unknown;
+  try {
+    doc = parseYaml(readFileSync(confPath, 'utf8'));
+  } catch (err) {
+    console.error(`Failed to parse ${confPath}: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
-  return {
-    apiUrl:
-      get('TB_API_URL') ??
-      'https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1',
+  if (typeof doc !== 'object' || doc === null) {
+    console.error(`${confPath}: expected a YAML mapping at the top level.`);
+    process.exit(1);
+  }
+  const yamlFile = doc as RunnerYamlFile;
+  const profiles = validateAndNormalizeProfiles(yamlFile.profiles, confPath);
+
+  const apiKey = process.env['TB_API_KEY'] ?? (typeof yamlFile.apiKey === 'string' ? yamlFile.apiKey : undefined);
+  if (!apiKey) {
+    console.error(
+      `TB_API_KEY is required - set the TB_API_KEY env var, or "apiKey:" in ${confPath}.`,
+    );
+    process.exit(1);
+  }
+
+  return profiles.map((p) => ({
+    apiUrl,
     apiKey,
-    runnerId: get('TB_RUNNER_ID') ?? `runner-${hostname()}`,
-    workdir: get('TB_WORKDIR') ?? join(homedir(), '.thoughtbridge-runner', 'work'),
-    agentCommand: get('TB_AGENT_COMMAND') ?? null,
-    model: get('TB_MODEL') ?? null,
-    agent: pickAdapter(get('TB_AGENT')),
-    pollSeconds: Number(get('TB_POLL_SECONDS') ?? 60),
-    maxSessions: Math.max(1, Number(get('TB_MAX_SESSIONS') ?? 3)),
-  };
+    runnerId: p.id as string,
+    // Namespaced per profile so two profiles never share a working copy of
+    // the same repo (extends every checkout key derived from workdir).
+    workdir: join(workdirBase, p.id as string),
+    agentCommand,
+    model: typeof p.model === 'string' ? p.model : null,
+    agent: pickAdapter(p.agent as string | undefined),
+    pollSeconds,
+    maxSessions,
+  }));
 }
 
 // ── session pool ────────────────────────────────────────────────────────────
@@ -960,11 +1099,20 @@ async function sweepChats(conf: Config, tb: TB): Promise<void> {
 
 // ── main loop ───────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  const conf = loadConfig();
+/**
+ * Runs ONE profile end to end: register → chat lane → restart recovery →
+ * poll/claim/build loop. Independent of every other profile - its own
+ * TB client (scoped by its own runnerId), its own SessionPool, its own
+ * namespaced workdir (see loadConfig). Safe to run several of these
+ * concurrently in the same process (see main()).
+ *
+ * `staggerMs` delays this profile's first poll iteration (not registration
+ * or recovery) so N profiles started together don't hit the API in lockstep
+ * every tick thereafter.
+ */
+async function runProfile(conf: Config, once: boolean, staggerMs: number): Promise<void> {
   mkdirSync(conf.workdir, { recursive: true });
   const tb = new TB(conf);
-  const once = process.argv.includes('--once');
 
   console.log(
     `thoughtbridge-runner ${conf.runnerId} on ${hostname()} (agent: ${conf.agent.name})` +
@@ -1018,6 +1166,11 @@ async function main(): Promise<void> {
     console.error('recovery error:', err instanceof Error ? err.message : err);
   }
 
+  // Stagger the poll loop's start across profiles (registration/recovery
+  // above already happened immediately - only the recurring cadence needs
+  // spreading out) so several profiles don't stampede the API in sync.
+  if (staggerMs > 0) await new Promise((r) => setTimeout(r, staggerMs));
+
   for (;;) {
     try {
       await sweepMergeRequests(conf, tb, pool);
@@ -1041,6 +1194,46 @@ async function main(): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, conf.pollSeconds * 1000));
   }
+}
+
+/** A little jitter between each profile's poll-loop start, per profile. */
+const PROFILE_STAGGER_MS = 3_000;
+
+/**
+ * Orchestrator: builds every configured profile, runs the startup preflight
+ * across all of them (see src/preflight.ts), then drives the healthy ones
+ * concurrently - one runProfile() per profile, same process.
+ *
+ * Exit codes:
+ *   - git or gh missing/unauthenticated → exit 1 (nothing works without them).
+ *   - at least one profile unhealthy but at least one healthy → serve the
+ *     healthy ones, exit 0 eventually (or when they finish, for --once).
+ *   - every profile unhealthy → exit 1.
+ */
+async function main(): Promise<void> {
+  const profiles = loadConfig();
+  const once = process.argv.includes('--once');
+
+  const outcome = runPreflight(profiles);
+  if (!outcome.gitOk || !outcome.ghOk) {
+    console.error('git and gh are both required - fix the issue(s) above and re-run.');
+    process.exit(1);
+  }
+  const healthyProfiles = profiles.filter((p) => outcome.healthyProfileIds.has(p.runnerId));
+  if (healthyProfiles.length === 0) {
+    console.error('No profile has a healthy, authenticated agent CLI - fix at least one and re-run.');
+    process.exit(1);
+  }
+  if (healthyProfiles.length < profiles.length) {
+    console.warn(
+      `Continuing with ${healthyProfiles.length}/${profiles.length} healthy profile(s): ` +
+        healthyProfiles.map((p) => p.runnerId).join(', '),
+    );
+  }
+
+  await Promise.all(
+    healthyProfiles.map((conf, i) => runProfile(conf, once, i * PROFILE_STAGGER_MS)),
+  );
 }
 
 main().catch((err) => {
