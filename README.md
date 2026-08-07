@@ -52,6 +52,9 @@ chmod +x thoughtbridge-runner-macos-arm64
 echo 'TB_API_KEY=tbk_…' > .env          # one-time setup; or pass it inline as below
 ./thoughtbridge-runner-macos-arm64          # poll loop (60s)
 ./thoughtbridge-runner-macos-arm64 --once   # single pass - good for testing
+
+# or fully parameterized, no files (see all flags: --help):
+TB_API_KEY=tbk_… ./thoughtbridge-runner-macos-arm64 --id runner-codex --agent codex --model gpt-5-codex
 ```
 
 ### Option B: clone + npm
@@ -63,6 +66,9 @@ npm install
 cp .env.example .env                # then put your real key in .env (one-time)
 npm start                           # poll loop (60s)
 npm run once                        # single pass - good for testing
+
+# or fully parameterized, no files (see all flags: --help):
+TB_API_KEY=tbk_... npx tsx src/index.ts --id runner-codex --agent codex --model gpt-5-codex
 ```
 
 Both options run the exact same code; the binary just skips the Node/tsx

@@ -107,6 +107,75 @@ interface RunnerYamlFile {
   profiles?: unknown;
 }
 
+/** CLI flag → env-var name. Flags outrank env vars, .env, and yaml. */
+const FLAG_TO_ENV: Record<string, string> = {
+  '--api-key': 'TB_API_KEY',
+  '--agent': 'TB_AGENT',
+  '--model': 'TB_MODEL',
+  '--id': 'TB_RUNNER_ID',
+  '--workdir': 'TB_WORKDIR',
+  '--poll-seconds': 'TB_POLL_SECONDS',
+  '--max-sessions': 'TB_MAX_SESSIONS',
+  '--agent-command': 'TB_AGENT_COMMAND',
+};
+
+const USAGE = `thoughtbridge-runner - turns "bridge it" thoughts into pull requests
+
+Usage: thoughtbridge-runner [flags]
+
+Flags (each also settable via the env var, a .env file, or runner.yaml):
+  --api-key <tbk_...>      runner-scoped ThoughtBridge API key (TB_API_KEY).
+                           Prefer .env or an inline env var: argv is visible
+                           to other local processes via ps.
+  --id <name>              runner name shown in the app's picker (TB_RUNNER_ID,
+                           default runner-<hostname>)
+  --agent <name>           claude | codex | gemini (TB_AGENT, default claude)
+  --model <name>           model for the agent CLI (TB_MODEL, default: the
+                           CLI's own configured model)
+  --workdir <path>         where repos are cloned (TB_WORKDIR)
+  --poll-seconds <n>       queue poll interval (TB_POLL_SECONDS, default 60)
+  --max-sessions <n>       max concurrent agent sessions (TB_MAX_SESSIONS)
+  --agent-command <cmd>    optional skill/slash-command prefix (TB_AGENT_COMMAND)
+  --config <path>          runner.yaml with multiple agent/model profiles
+  --once                   single pass instead of the poll loop
+  --help                   this text
+
+Profile flags (--id/--agent/--model) apply to single-runner mode; with a
+runner.yaml the profiles in the file win and those three flags are ignored.`;
+
+/** Parses known --flag value pairs into their env-var names; exits on
+ *  --help or on an unknown --flag so typos never silently become defaults. */
+function parseFlags(): Record<string, string> {
+  const args = process.argv.slice(2);
+  const overrides: Record<string, string> = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--help' || a === '-h') {
+      console.log(USAGE);
+      process.exit(0);
+    }
+    if (a === '--once' || a === '--config') {
+      if (a === '--config') i++;
+      continue;
+    }
+    if (FLAG_TO_ENV[a]) {
+      const v = args[i + 1];
+      if (v === undefined || v.startsWith('--')) {
+        console.error(`${a} requires a value.\n\n${USAGE}`);
+        process.exit(1);
+      }
+      overrides[FLAG_TO_ENV[a]!] = v;
+      i++;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      console.error(`Unknown flag ${a}.\n\n${USAGE}`);
+      process.exit(1);
+    }
+  }
+  return overrides;
+}
+
 /** --config <path> flag, else TB_CONFIG env, else ./runner.yaml if present. */
 function resolveConfigPath(): string | null {
   const args = process.argv.slice(2);
@@ -186,7 +255,9 @@ function loadConfig(): Config[] {
       fileConf[m[1]] = v;
     }
   }
-  const get = (key: string): string | undefined => process.env[key] ?? fileConf[key];
+  const flags = parseFlags();
+  const get = (key: string): string | undefined =>
+    flags[key] ?? process.env[key] ?? fileConf[key];
 
   const apiUrl =
     get('TB_API_URL') ?? 'https://thoughtbridge-api-238666896847.australia-southeast1.run.app/v1';
@@ -204,7 +275,8 @@ function loadConfig(): Config[] {
           'Provide it one of three ways:\n' +
           '  1. a .env file in this directory containing:  TB_API_KEY=tbk_...\n' +
           '  2. inline:  TB_API_KEY=tbk_... npm start\n' +
-          '  3. "apiKey:" in a runner.yaml (see README for the profile format)',
+          '  3. the --api-key flag (visible to local ps - prefer .env)\n' +
+          '  4. "apiKey:" in a runner.yaml (see README for the profile format)',
       );
       process.exit(1);
     }
@@ -223,6 +295,11 @@ function loadConfig(): Config[] {
     ];
   }
 
+  for (const f of ['--id', '--agent', '--model'] as const) {
+    if (flags[FLAG_TO_ENV[f]!] !== undefined) {
+      console.error(`warning: ${f} is ignored when a runner.yaml is in use - profiles in ${confPath} win.`);
+    }
+  }
   let doc: unknown;
   try {
     doc = parseYaml(readFileSync(confPath, 'utf8'));
