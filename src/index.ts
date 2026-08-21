@@ -1227,14 +1227,17 @@ async function runProfile(conf: Config, once: boolean, staggerMs: number): Promi
   // Chat lane: its own faster poll (10s) so conversations feel responsive -
   // fully independent of the build queue and TB_MAX_SESSIONS.
   if (!once) {
+    const chatHealth = makePollHealth('chat');
     void (async () => {
       for (;;) {
+        let chatBackoff = 0;
         try {
           await sweepChats(conf, tb);
+          chatHealth.recovered();
         } catch (err) {
-          console.error('chat poll error:', err instanceof Error ? err.message : err);
+          chatBackoff = chatHealth.failed(err);
         }
-        await new Promise((r) => setTimeout(r, 10_000));
+        await new Promise((r) => setTimeout(r, 10_000 + chatBackoff));
       }
     })();
   }
@@ -1269,7 +1272,9 @@ async function runProfile(conf: Config, once: boolean, staggerMs: number): Promi
   // spreading out) so several profiles don't stampede the API in sync.
   if (staggerMs > 0) await new Promise((r) => setTimeout(r, staggerMs));
 
+  const queueHealth = makePollHealth('queue');
   for (;;) {
+    let queueBackoff = 0;
     try {
       await sweepMergeRequests(conf, tb, pool);
       await checkOpenPRs(tb);
@@ -1281,8 +1286,9 @@ async function runProfile(conf: Config, once: boolean, staggerMs: number): Promi
         pool.schedule(r.repoFullName, r.captureId, () => executeRun(conf, tb, r));
       }
       if (runs.length === 0 && once) console.log('queue empty');
+      queueHealth.recovered();
     } catch (err) {
-      console.error('poll error:', err instanceof Error ? err.message : err);
+      queueBackoff = queueHealth.failed(err);
     }
     if (once) {
       await sweepChats(conf, tb).catch(() => {});
@@ -1290,7 +1296,7 @@ async function runProfile(conf: Config, once: boolean, staggerMs: number): Promi
       await pool.drain();
       break;
     }
-    await new Promise((r) => setTimeout(r, conf.pollSeconds * 1000));
+    await new Promise((r) => setTimeout(r, conf.pollSeconds * 1000 + queueBackoff));
   }
 }
 
@@ -1308,6 +1314,43 @@ const PROFILE_STAGGER_MS = 3_000;
  *     healthy ones, exit 0 eventually (or when they finish, for --once).
  *   - every profile unhealthy → exit 1.
  */
+
+/**
+ * Collapses repeated poll failures into a readable stream: the first failure
+ * logs with its underlying cause (Node's "fetch failed" hides ECONNRESET /
+ * DNS errors inside err.cause), repeats log every 6th occurrence, and
+ * recovery logs once with the outage size. Days-long runs otherwise print
+ * hundreds of identical lines across every laptop sleep. Returns the extra
+ * backoff milliseconds to add while the lane is failing.
+ */
+function makePollHealth(lane: string): {
+  failed(err: unknown): number;
+  recovered(): void;
+} {
+  let streak = 0;
+  return {
+    failed(err: unknown): number {
+      streak++;
+      const cause =
+        err instanceof Error && err.cause instanceof Error
+          ? ` (${err.cause.message})`
+          : '';
+      const msg = err instanceof Error ? err.message : String(err);
+      if (streak === 1) {
+        console.error(`${lane} poll error: ${msg}${cause} - network down or API unreachable; will keep retrying quietly`);
+      } else if (streak % 6 === 0) {
+        console.error(`${lane} poll still failing (x${streak}): ${msg}${cause}`);
+      }
+      // After 3 consecutive failures, slow down: the network is down, not slow.
+      return streak >= 3 ? 50_000 : 0;
+    },
+    recovered(): void {
+      if (streak >= 2) console.log(`${lane} poll recovered after ${streak} failures`);
+      streak = 0;
+    },
+  };
+}
+
 async function main(): Promise<void> {
   const profiles = loadConfig();
   const once = process.argv.includes('--once');
