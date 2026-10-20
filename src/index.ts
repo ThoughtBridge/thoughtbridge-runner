@@ -38,6 +38,10 @@
  *   TB_AGENT_COMMAND  - optional skill/slash-command prefix (e.g. "/bee-feature").
  *                       Absent → plain prompt (the default for everyone).
  *   TB_MODEL          - model for every agent session the runner drives.
+ *                       For claude sessions in a Bee project, the checkout's
+ *                       bee.yaml models.queen.model takes precedence, and a
+ *                       Bee project with neither defaults to claude-opus-5-5
+ *                       (see resolveModel()).
  *                       For claude: an alias ("sonnet", "opus", "fable",
  *                       "haiku") or a full model name, passed as --model.
  *                       For codex/gemini: passed as -m. Absent → each CLI's
@@ -586,6 +590,41 @@ ${message}`;
 }
 
 /**
+ * Model for one agent session. Bee projects declare theirs in bee.yaml
+ * (models.queen.model - Bee's queen-orchestrate §2g says runners pass it as
+ * --model): that wins when present; a Bee project that omits it falls back
+ * to the runner's own --model/TB_MODEL, then to Bee's documented default
+ * (claude-opus-5-5). Non-Bee checkouts keep the old behavior (conf.model or
+ * the CLI's own default). Claude-only - Bee model ids mean nothing to
+ * codex/gemini. A declared "inherit" means "no preference": conf.model.
+ */
+const BEE_MODEL_ALIASES: Record<string, string> = {
+  'opus-5.5': 'claude-opus-5-5',
+  'sonnet-5.5': 'claude-sonnet-5-5',
+  'haiku-5.5': 'claude-haiku-5-5',
+};
+function resolveModel(conf: Config, dir: string): string | null {
+  if (conf.agent.name !== 'claude') return conf.model;
+  let raw: string;
+  try {
+    raw = readFileSync(join(dir, 'bee.yaml'), 'utf8');
+  } catch {
+    return conf.model; // not a Bee project - unchanged behavior
+  }
+  let declared: string | null = null;
+  try {
+    const doc = parseYaml(raw) as { models?: { queen?: { model?: unknown } } } | null;
+    const m = doc?.models?.queen?.model;
+    if (typeof m === 'string' && m.trim()) declared = m.trim();
+  } catch {
+    // unparseable bee.yaml - still a Bee project; use the defaults below
+  }
+  if (declared === 'inherit') return conf.model;
+  const model = declared ?? conf.model ?? 'claude-opus-5-5';
+  return BEE_MODEL_ALIASES[model] ?? model;
+}
+
+/**
  * Spawns one agent turn. When the active adapter can resume (claude, codex),
  * this is a thin pass-through to adapter.spawn - byte-identical to calling
  * it directly. When it can't (gemini), turns after the first are replayed
@@ -604,11 +643,11 @@ async function spawnTurn(
   message: string,
 ): Promise<SessionResult> {
   if (conf.agent.canResume) {
-    return conf.agent.spawn(dir, message, sessionId, conf.model);
+    return conf.agent.spawn(dir, message, sessionId, resolveModel(conf, dir));
   }
   const isFirstTurn = sessionId === null;
   const prompt = isFirstTurn ? message : buildReplayPrompt(contextHeader, readHistory(dir, captureId), message);
-  const result = await conf.agent.spawn(dir, prompt, null, conf.model);
+  const result = await conf.agent.spawn(dir, prompt, null, resolveModel(conf, dir));
   appendHistory(dir, captureId, 'prompt', message);
   appendHistory(dir, captureId, 'reply', result.text);
   // No real session id to hand back - synthesize a stable, truthy one scoped
@@ -1157,14 +1196,14 @@ async function answerChat(conf: Config, tb: TB, chat: PendingChat): Promise<void
       // chat.sessionId is already falsy here on every turn for them, and
       // chatPrompt naturally takes its "no session, full history" branch.
       // No separate history file needed - chat.messages IS that history.
-      result = await conf.agent.spawn(dir, chatPrompt(chat, dir), chat.sessionId, conf.model);
+      result = await conf.agent.spawn(dir, chatPrompt(chat, dir), chat.sessionId, resolveModel(conf, dir));
     } catch (err) {
       if (!chat.sessionId) throw err;
       // Sessions are per-directory: a repo/destination change strands the
       // stored id. Start fresh with the full preamble + history instead.
       console.log(`${tag} stored session unusable - starting fresh`);
       const fresh: PendingChat = { ...chat, sessionId: null };
-      result = await conf.agent.spawn(dir, chatPrompt(fresh, dir), null, conf.model);
+      result = await conf.agent.spawn(dir, chatPrompt(fresh, dir), null, resolveModel(conf, dir));
     }
     const text = result.text.trim() || '(Bridget had nothing to say - try rephrasing.)';
     await tb.chatReply(chat.projectId, text, result.sessionId || null, chat.pendingCount);

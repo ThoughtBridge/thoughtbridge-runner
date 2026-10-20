@@ -127,6 +127,7 @@ Config via env or `~/.thoughtbridge-runner.json`:
 | `TB_AGENT` | `claude` | which coding-agent CLI drives sessions: `claude`, `codex`, or `gemini`. See `src/agents.ts`. |
 | `TB_AGENT_COMMAND` | *(none - plain prompt)* | your own skill/slash command, e.g. `/my-orchestrator`. The runner invokes it with the thought and steps back. |
 | `TB_MODEL` | *(none - the agent's default)* | model for every session the runner drives, passed as `--model` (claude) or `-m` (codex, gemini). |
+| | | **Bee projects:** for claude sessions, a `bee.yaml` in the checkout wins - `models.queen.model` (aliases `opus-5.5`/`sonnet-5.5`/`haiku-5.5` accepted, `inherit` = no preference); a Bee project with neither `TB_MODEL` nor the key defaults to `claude-opus-5-5`. Non-Bee checkouts are unchanged. |
 | `TB_POLL_SECONDS` | `60` | queue poll interval |
 | `TB_MAX_SESSIONS` | `3` | max concurrent agent sessions per profile (always at most ONE session per repo checkout) |
 | `TB_CONFIG` | *(none)* | path to a `runner.yaml` - same as `--config <path>`. Presence of `./runner.yaml` (cwd) also triggers config-file mode without setting this. |
